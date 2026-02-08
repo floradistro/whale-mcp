@@ -79,9 +79,9 @@ export const symbols = {
   user:       ">",
   assistant:  " ",
 
-  // Tool types
-  local:      "⚡",
-  server:     "☁",
+  // Tool types (JetBrains Mono-safe — no emoji-capable codepoints)
+  local:      "▸",
+  server:     "▹",
 
   // Structure
   divider:    "─",

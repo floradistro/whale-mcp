@@ -6,7 +6,7 @@
  * - "Claude Code uses about a dozen tools"
  * - "Consolidate multi-step operations into single tool calls"
  *
- * 39 tools → 12 consolidated tools:
+ * 39 tools → 15 consolidated tools:
  *
  * 1. inventory      - manage inventory (adjust, set, transfer, bulk operations)
  * 2. inventory_query - query inventory (summary, velocity, by_location, in_stock)
@@ -14,14 +14,15 @@
  * 4. collections    - manage collections (find, create, get_theme, set_theme, set_icon)
  * 5. customers      - manage customers (find, create, update)
  * 6. products       - manage products (find, create, update, pricing)
- * 7. analytics      - analytics & intelligence (summary, by_location, detailed, discover, employee, customers, products, inventory_intelligence, marketing, fraud, employee_performance, behavior, full)
+ * 7. analytics      - analytics & intelligence (summary, by_location, detailed, discover, employee, etc.)
  * 8. locations      - find/list locations
  * 9. orders         - manage orders (find, get, create)
  * 10. suppliers     - find suppliers
- * 11. email         - unified email (send, send_template, list, get, templates)
+ * 11. email         - unified email (send, send_template, list, get, templates, inbox)
  * 12. documents     - document generation
  * 13. alerts        - system alerts
- * 14. audit_trail   - audit logs
+ * 14. web_search    - Exa-powered web search (API key from platform_secrets)
+ * 15. audit_trail   - audit logs
  */
 
 import { SupabaseClient } from "@supabase/supabase-js";
@@ -2006,9 +2007,12 @@ const handlers: Record<string, ToolHandler> = {
   // ===========================================================================
   suppliers: async (supabase, args, storeId) => {
     try {
-      let q = supabase.from("suppliers").select("*");
+      let q = supabase.from("suppliers").select("id, store_id, external_name, external_company, contact_name, contact_email, contact_phone, city, state, is_active, payment_terms, notes, created_at");
       if (storeId) q = q.eq("store_id", storeId);
-      if (args.name) q = q.ilike("name", `%${args.name}%`);
+      if (args.name) {
+        const search = `%${args.name}%`;
+        q = q.or(`external_name.ilike.${search},external_company.ilike.${search},contact_name.ilike.${search}`);
+      }
       const { data, error } = await q.limit(50);
       if (error) return { success: false, error: error.message };
       return { success: true, data };
@@ -2583,7 +2587,98 @@ const handlers: Record<string, ToolHandler> = {
   },
 
   // ===========================================================================
-  // 14. AUDIT_TRAIL - View audit logs
+  // 14. WEB_SEARCH - Exa-powered web search (API key from platform_secrets)
+  // ===========================================================================
+  web_search: async (supabase, args, storeId) => {
+    const query = args.query as string;
+    if (!query) return { success: false, error: "query is required", errorType: ToolErrorType.VALIDATION, retryable: false };
+
+    const numResults = Math.min((args.num_results as number) || 10, 20);
+    const searchType = (args.type as string) || "auto";
+    const allowedDomains = args.allowed_domains as string[] | undefined;
+    const blockedDomains = args.blocked_domains as string[] | undefined;
+    const includeContents = (args.include_contents as boolean) ?? true;
+
+    // Fetch API key from backend (never stored on client)
+    const { data: secretRow, error: secretErr } = await supabase
+      .from("platform_secrets")
+      .select("value")
+      .eq("key", "exa_api_key")
+      .single();
+
+    if (secretErr || !secretRow?.value) {
+      return {
+        success: false,
+        error: "Exa API key not configured. Add 'exa_api_key' to platform_secrets table.",
+        errorType: ToolErrorType.AUTH,
+        retryable: false,
+      };
+    }
+
+    const apiKey = secretRow.value;
+
+    try {
+      // Exa search + contents in one call
+      const endpoint = includeContents
+        ? "https://api.exa.ai/search"
+        : "https://api.exa.ai/search";
+
+      const body: Record<string, unknown> = {
+        query,
+        numResults,
+        type: searchType,
+        contents: includeContents ? { text: { maxCharacters: 1200, includeHtmlTags: false } } : undefined,
+      };
+
+      if (allowedDomains?.length) body.includeDomains = allowedDomains;
+      if (blockedDomains?.length) body.excludeDomains = blockedDomains;
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text();
+        return {
+          success: false,
+          error: `Exa API error (${response.status}): ${errBody}`,
+          errorType: response.status === 429 ? ToolErrorType.RATE_LIMIT : ToolErrorType.RECOVERABLE,
+          retryable: response.status === 429 || response.status >= 500,
+        };
+      }
+
+      const data = await response.json();
+      const results = (data.results || []).map((r: any, i: number) => {
+        const parts = [
+          `${i + 1}. **${r.title || "Untitled"}**`,
+          `   ${r.url}`,
+        ];
+        if (r.publishedDate) parts.push(`   Published: ${r.publishedDate}`);
+        if (r.text) parts.push(`   ${r.text.slice(0, 500)}`);
+        return parts.join("\n");
+      });
+
+      return {
+        success: true,
+        data: `Found ${results.length} results for "${query}":\n\n${results.join("\n\n")}`,
+      };
+    } catch (err: any) {
+      if (err.name === "TimeoutError" || err.message?.includes("timeout")) {
+        return { success: false, error: "Exa search timed out (15s)", errorType: ToolErrorType.RECOVERABLE, retryable: true, timedOut: true };
+      }
+      return { success: false, error: `Web search error: ${err.message || err}`, errorType: ToolErrorType.RECOVERABLE, retryable: true };
+    }
+  },
+
+  // ===========================================================================
+  // 15. AUDIT_TRAIL - View audit logs
   // ===========================================================================
   audit_trail: async (supabase, args, storeId) => {
     try {
@@ -2616,7 +2711,7 @@ export type SpanKind = "CLIENT" | "SERVER" | "INTERNAL" | "PRODUCER" | "CONSUMER
 
 export interface ExecutionContext {
   // Basic identification
-  source: "claude_code" | "swag_manager" | "api" | "edge_function" | "mcp" | "test" | "whale_mcp";
+  source: "claude_code" | "swag_manager" | "api" | "edge_function" | "mcp" | "test" | "whale_mcp" | "whale_chat";
   userId?: string;
   userEmail?: string;
 

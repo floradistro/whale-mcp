@@ -18,14 +18,19 @@ export interface SlashCommand {
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
-  { name: "/help",   description: "Show available commands" },
-  { name: "/tools",  description: "List all tools" },
-  { name: "/mcp",    description: "Server connection status" },
-  { name: "/store",  description: "Switch active store" },
-  { name: "/status", description: "Show session info" },
-  { name: "/update", description: "Check for updates & install" },
-  { name: "/clear",  description: "Clear conversation" },
-  { name: "/exit",   description: "Exit" },
+  { name: "/help",     description: "Show available commands" },
+  { name: "/tools",    description: "List all tools" },
+  { name: "/model",    description: "Switch model (sonnet/opus/haiku)" },
+  { name: "/compact",  description: "Compress conversation context" },
+  { name: "/save",     description: "Save session to disk" },
+  { name: "/sessions", description: "List saved sessions" },
+  { name: "/resume",   description: "Resume a saved session" },
+  { name: "/mcp",      description: "Server connection status" },
+  { name: "/store",    description: "Switch active store" },
+  { name: "/status",   description: "Show session info" },
+  { name: "/update",   description: "Check for updates & install" },
+  { name: "/clear",    description: "Clear conversation" },
+  { name: "/exit",     description: "Exit" },
 ];
 
 interface ChatInputProps {

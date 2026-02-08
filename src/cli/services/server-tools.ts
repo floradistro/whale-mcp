@@ -50,6 +50,7 @@ const SERVER_TOOL_NAMES = new Set([
   "email",
   "documents",
   "alerts",
+  "web_search",
   "audit_trail",
 ]);
 
@@ -365,6 +366,22 @@ const SERVER_TOOL_DEFINITIONS: Anthropic.Tool[] = [
         template: { type: "string", description: "Document template" },
       },
       required: [],
+    },
+  },
+  {
+    name: "web_search",
+    description: "Search the web using Exa AI. Returns titles, URLs, and text snippets. API key is stored securely in backend.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Search query" },
+        num_results: { type: "number", description: "Number of results (default 10, max 20)" },
+        type: { type: "string", enum: ["neural", "keyword", "auto"], description: "Search type: neural (semantic), keyword (exact), auto (default)" },
+        allowed_domains: { type: "array", items: { type: "string" }, description: "Only include results from these domains" },
+        blocked_domains: { type: "array", items: { type: "string" }, description: "Exclude results from these domains" },
+        include_contents: { type: "boolean", description: "Include page text snippets (default true)" },
+      },
+      required: ["query"],
     },
   },
   {

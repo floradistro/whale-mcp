@@ -11,7 +11,7 @@ import React, { useMemo } from "react";
 import { Box, Text } from "ink";
 import Spinner from "ink-spinner";
 import { MarkdownText } from "./MarkdownText.js";
-import { colors } from "../shared/Theme.js";
+import { colors, symbols } from "../shared/Theme.js";
 import { isLocalTool } from "../services/local-tools.js";
 
 // ============================================================================
@@ -123,7 +123,7 @@ export function ToolIndicator({ name, status, result, input, durationMs, expande
 
   // Purple for local tools, pink for server tools
   const toolColor = local ? "#BF5AF2" : "#FF375F";
-  const typeGlyph = local ? "⚡" : "☁";
+  const typeGlyph = local ? symbols.local : symbols.server;
 
   // ── RUNNING ──
   if (status === "running") {
@@ -161,7 +161,7 @@ export function ToolIndicator({ name, status, result, input, durationMs, expande
 
   return (
     <Box flexDirection="column" marginBottom={0}>
-      {/* Header: ✓ ⚡ tool_name  context  420ms */}
+      {/* Header: ✓ ▸ tool_name  context  420ms */}
       <Box>
         <Text color="#30D158">✓</Text>
         <Text color="#6E6E73"> {typeGlyph}</Text>

@@ -9,7 +9,12 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { execSync } from "child_process";
 import Anthropic from "@anthropic-ai/sdk";
-import { runAgentLoop, canUseAgent, getServerToolCount, getServerStatus } from "../services/agent-loop.js";
+import {
+  runAgentLoop, canUseAgent, getServerToolCount, getServerStatus,
+  setModel, getModel, getModelShortName,
+  loadClaudeMd, compressContext, getSessionTokens,
+  saveSession, loadSession, listSessions, type SessionMeta,
+} from "../services/agent-loop.js";
 import { getAllServerToolDefinitions, resetServerToolClient } from "../services/server-tools.js";
 import { LOCAL_TOOL_DEFINITIONS } from "../services/local-tools.js";
 import { MessageList, type ChatMessage, type ToolCall } from "./MessageList.js";
@@ -40,6 +45,8 @@ export function ChatApp() {
   const [serverToolsAvailable, setServerToolsAvailable] = useState(0);
   const [storeSelectMode, setStoreSelectMode] = useState(false);
   const [storeList, setStoreList] = useState<StoreInfo[]>([]);
+  const [currentModel, setCurrentModel] = useState(getModelShortName());
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const conversationRef = useRef<Anthropic.MessageParam[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -71,7 +78,7 @@ export function ChatApp() {
   });
 
   // ── Commands ──
-  const handleCommand = useCallback((command: string) => {
+  const handleCommand = useCallback(async (command: string) => {
     switch (command) {
       case "/help":
         setMessages((prev) => [...prev, {
@@ -96,20 +103,29 @@ export function ChatApp() {
 
       case "/status": {
         const config = loadConfig();
+        const localCount = LOCAL_TOOL_DEFINITIONS.length;
         const toolsLine = serverToolsAvailable > 0
-          ? `  tools     7 local + ${serverToolsAvailable} server`
-          : `  tools     7 local`;
-        setMessages((prev) => [...prev, {
-          role: "assistant",
-          text: [
-            `  version   v${PKG_VERSION}`,
-            `  user      ${config.email || "—"}`,
-            `  store     ${config.store_name || "—"}`,
-            `  model     claude-sonnet-4`,
-            toolsLine,
-            `  expand    ${toolsExpanded ? "on" : "off"}  (^E)`,
-          ].join("\n"),
-        }]);
+          ? `  tools     ${localCount} local + ${serverToolsAvailable} server`
+          : `  tools     ${localCount} local`;
+        const claudeMd = loadClaudeMd();
+        const tokens = getSessionTokens();
+        const tokenLine = tokens.input > 0
+          ? `  tokens    ${(tokens.input / 1000).toFixed(1)}K in / ${(tokens.output / 1000).toFixed(1)}K out`
+          : `  tokens    (no usage yet)`;
+        const lines = [
+          `  version   v${PKG_VERSION}`,
+          `  user      ${config.email || "—"}`,
+          `  store     ${config.store_name || "—"}`,
+          `  model     ${getModelShortName()}  (${getModel()})`,
+          `  output    16384 max tokens`,
+          toolsLine,
+          tokenLine,
+          `  session   ${sessionId || "(unsaved)"}`,
+          `  CLAUDE.md ${claudeMd ? claudeMd.path : "not found"}`,
+          `  context   ${conversationRef.current.length} messages`,
+          `  expand    ${toolsExpanded ? "on" : "off"}  (^E)`,
+        ];
+        setMessages((prev) => [...prev, { role: "assistant", text: lines.join("\n") }]);
         break;
       }
 
@@ -177,9 +193,93 @@ export function ChatApp() {
         break;
       }
 
+      case "/model": {
+        const models = ["sonnet", "opus", "haiku"];
+        const current = getModelShortName();
+        // Cycle to next model
+        const nextIdx = (models.indexOf(current) + 1) % models.length;
+        const next = models[nextIdx];
+        const result = setModel(next);
+        setCurrentModel(next);
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: `  ${symbols.check} Model: ${next}  (${result.model})`,
+        }]);
+        break;
+      }
+
+      case "/compact": {
+        const before = conversationRef.current.length;
+        if (before < 6) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  Conversation too short to compress." }]);
+        } else {
+          // Force compression by importing and calling directly
+          conversationRef.current = compressContext(conversationRef.current);
+          const after = conversationRef.current.length;
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Compressed: ${before} messages → ${after} messages`,
+          }]);
+        }
+        break;
+      }
+
+      case "/save": {
+        if (conversationRef.current.length === 0) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  Nothing to save." }]);
+        } else {
+          const id = saveSession(conversationRef.current, sessionId || undefined);
+          setSessionId(id);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Session saved: ${id}`,
+          }]);
+        }
+        break;
+      }
+
+      case "/sessions": {
+        const sessions = listSessions();
+        if (sessions.length === 0) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  No saved sessions." }]);
+        } else {
+          const lines = sessions.map((s, i) =>
+            `  ${String(i + 1).padStart(2)}. ${s.title.slice(0, 40).padEnd(42)} ${s.messageCount} msgs  ${s.updatedAt.slice(0, 10)}`
+          );
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  Saved sessions:\n${lines.join("\n")}\n\n  Use /resume to load a session.`,
+          }]);
+        }
+        break;
+      }
+
+      case "/resume": {
+        const sessions = listSessions();
+        if (sessions.length === 0) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  No saved sessions." }]);
+        } else {
+          // Resume most recent session
+          const latest = sessions[0];
+          const loaded = loadSession(latest.id);
+          if (loaded) {
+            conversationRef.current = loaded.messages;
+            setSessionId(latest.id);
+            if (loaded.meta.model) setModel(loaded.meta.model);
+            setMessages((prev) => [...prev, {
+              role: "assistant",
+              text: `  ${symbols.check} Resumed: ${latest.title}\n  ${latest.messageCount} messages, model: ${getModelShortName()}`,
+            }]);
+          } else {
+            setMessages((prev) => [...prev, { role: "assistant", text: "  Failed to load session." }]);
+          }
+        }
+        break;
+      }
+
       case "/tools": {
         const lines: string[] = [];
-        lines.push("  Local (7)");
+        lines.push(`  Local (${LOCAL_TOOL_DEFINITIONS.length})`);
         for (const t of LOCAL_TOOL_DEFINITIONS) {
           lines.push(`    ${t.name.padEnd(20)} ${t.description.slice(0, 48)}`);
         }
@@ -259,6 +359,12 @@ export function ChatApp() {
         onUsage: (input_tokens, output_tokens) => {
           usage = { input_tokens, output_tokens };
         },
+        onAutoCompact: (before, after, tokensSaved) => {
+          setMessages((prev) => [...prev, {
+            role: "assistant" as const,
+            text: `  Context auto-compacted: ${before} messages -> ${after} messages (~${(tokensSaved / 1000).toFixed(0)}K tokens freed)`,
+          }]);
+        },
         onDone: (finalMessages) => {
           setMessages((prev) => [...prev, {
             role: "assistant" as const,
@@ -310,6 +416,7 @@ export function ChatApp() {
       <Box>
         <Text color={colors.brand} bold>◆ whale code</Text>
         {userLabel && <Text color={colors.dim}>  {userLabel}</Text>}
+        <Text color={colors.dim}>  {currentModel}</Text>
         {serverToolsAvailable > 0 && (
           <Text color={colors.tertiary}>  {symbols.dot} {serverToolsAvailable} server tools</Text>
         )}

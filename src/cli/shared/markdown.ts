@@ -142,7 +142,7 @@ marked.use(
 
       // Blocks
       blockquote: secondary.italic,
-      paragraph: text,
+      paragraph: (body: string) => colorizeFinancials(body),
       hr: () => separator("─".repeat(50)),
 
       // Links
@@ -162,51 +162,6 @@ marked.use(
       },
       listitem: (itemText: string) => {
         return colorizeFinancials(itemText);
-      },
-
-      // Tables — polished
-      table: (header: string, body: string) => {
-        const divider = separator("─".repeat(64));
-        return `\n${header}${divider}\n${body}\n`;
-      },
-      tablerow: (content: string) => {
-        return `${content}\n`;
-      },
-      tablecell: (content: string, flags: { header?: boolean; align?: string }) => {
-        const trimmed = content.trim();
-
-        if (flags.header) {
-          return systemIndigo.bold(content.padEnd(18)) + " ";
-        }
-
-        // Negative values → red
-        if (/^-\$?[\d,]+\.?\d*$/.test(trimmed) || /^-\d+\.?\d*%$/.test(trimmed)) {
-          return systemRed(content.padEnd(18)) + " ";
-        }
-        // Positive financial → green
-        if (/^\+?\$[\d,]+\.?\d*$/.test(trimmed) || /^\+\d+/.test(trimmed)) {
-          return systemGreen(content.padEnd(18)) + " ";
-        }
-        // Plain numbers → mint
-        if (/^[\d,]+\.?\d*$/.test(trimmed)) {
-          return systemMint(content.padEnd(18)) + " ";
-        }
-        // Percentages → cyan
-        if (/^\d+\.?\d*%$/.test(trimmed)) {
-          return systemCyan(content.padEnd(18)) + " ";
-        }
-        // Status words
-        if (/^(active|success|complete|approved|in stock)/i.test(trimmed)) {
-          return systemGreen(content.padEnd(18)) + " ";
-        }
-        if (/^(inactive|error|failed|cancelled|out of stock|low|overdue)/i.test(trimmed)) {
-          return systemRed(content.padEnd(18)) + " ";
-        }
-        if (/^(pending|draft|processing)/i.test(trimmed)) {
-          return systemOrange(content.padEnd(18)) + " ";
-        }
-
-        return text(content.padEnd(18)) + " ";
       },
 
       // Layout
@@ -300,7 +255,103 @@ function renderBarChart(code: string): string {
   return "\n" + out.join("\n") + "\n";
 }
 
-// Register chart extension — intercepts ```chart blocks before markedTerminal
+// ============================================================================
+// Table renderer — intercepts markdown tables before markedTerminal
+// ============================================================================
+
+function colorizeCell(val: string, isHeader: boolean): string {
+  const trimmed = val.trim();
+  if (!trimmed) return text("");
+  if (isHeader) return systemIndigo.bold(trimmed);
+
+  // Negative values → red
+  if (/^-\$?[\d,]+\.?\d*$/.test(trimmed) || /^-\d+\.?\d*%$/.test(trimmed)) {
+    return systemRed(trimmed);
+  }
+  // Positive financial → green
+  if (/^\+?\$[\d,]+\.?\d*$/.test(trimmed) || /^\$[\d,]+\.?\d*$/.test(trimmed)) {
+    return systemGreen(trimmed);
+  }
+  // Percentages → cyan
+  if (/^\d+\.?\d*%$/.test(trimmed)) {
+    return systemCyan(trimmed);
+  }
+  // Plain numbers → mint
+  if (/^[\d,]+\.?\d*$/.test(trimmed)) {
+    return systemMint(trimmed);
+  }
+  // Status words
+  if (/^(active|success|complete|approved|in stock|available)/i.test(trimmed)) {
+    return systemGreen(trimmed);
+  }
+  if (/^(inactive|error|failed|cancelled|out of stock|low|overdue|expired)/i.test(trimmed)) {
+    return systemRed(trimmed);
+  }
+  if (/^(pending|draft|processing)/i.test(trimmed)) {
+    return systemOrange(trimmed);
+  }
+  return text(trimmed);
+}
+
+function renderTable(token: any): string {
+  // Extract cell text from token — handles both inline tokens and plain text
+  function getCellText(cell: any): string {
+    if (!cell) return "";
+    if (typeof cell === "string") return cell;
+    if (cell.text !== undefined) return String(cell.text);
+    if (cell.tokens) {
+      return cell.tokens.map((t: any) => t.raw || t.text || "").join("");
+    }
+    return String(cell);
+  }
+
+  const headers: string[] = (token.header || []).map((h: any) => getCellText(h));
+  const rows: string[][] = (token.rows || []).map((row: any) =>
+    row.map((cell: any) => getCellText(cell))
+  );
+
+  if (headers.length === 0) return "";
+
+  // Calculate column widths (min 8, max 24)
+  const colWidths = headers.map((h: string, i: number) => {
+    const dataMax = rows.reduce((max: number, row: string[]) =>
+      Math.max(max, (row[i] || "").length), 0);
+    return Math.min(24, Math.max(8, h.length, dataMax) + 2);
+  });
+
+  const border = chalk.hex("#48484A");
+  const out: string[] = [];
+
+  // Top border: ╭──────┬──────╮
+  out.push(border("  ╭" + colWidths.map((w: number) => "─".repeat(w + 2)).join("┬") + "╮"));
+
+  // Header row
+  const hdrLine = headers.map((h: string, i: number) =>
+    " " + systemIndigo.bold(h.padEnd(colWidths[i])) + " "
+  ).join(border("│"));
+  out.push(border("  │") + hdrLine + border("│"));
+
+  // Header/body divider: ├──────┼──────┤
+  out.push(border("  ├" + colWidths.map((w: number) => "─".repeat(w + 2)).join("┼") + "┤"));
+
+  // Data rows
+  for (const row of rows) {
+    const cells = headers.map((_: string, i: number) => {
+      const val = row[i] || "";
+      const colored = colorizeCell(val, false);
+      const extraPad = Math.max(0, colWidths[i] - val.length);
+      return " " + colored + " ".repeat(extraPad) + " ";
+    }).join(border("│"));
+    out.push(border("  │") + cells + border("│"));
+  }
+
+  // Bottom border: ╰──────┴──────╯
+  out.push(border("  ╰" + colWidths.map((w: number) => "─".repeat(w + 2)).join("┴") + "╯"));
+
+  return "\n" + out.join("\n") + "\n";
+}
+
+// Register chart + table extensions — intercepts before markedTerminal
 marked.use({
   renderer: {
     code(this: any, token: any) {
@@ -310,6 +361,9 @@ marked.use({
         return renderBarChart(code);
       }
       return false; // fall through to markedTerminal
+    },
+    table(this: any, token: any) {
+      return renderTable(token);
     },
   } as any,
 });
