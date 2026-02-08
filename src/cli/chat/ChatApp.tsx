@@ -19,10 +19,13 @@ import { colors, symbols, boxLine } from "../shared/Theme.js";
 import { loadConfig } from "../services/config-store.js";
 import { getStoresForUser, getValidToken, selectStore, type StoreInfo } from "../services/auth-service.js";
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
 const PKG_NAME = "swagmanager-mcp";
-const require = createRequire(import.meta.url);
-const PKG_VERSION: string = require("../../package.json").version;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PKG_VERSION: string = createRequire(import.meta.url)(join(__dirname, "..", "..", "..", "package.json")).version;
 
 export function ChatApp() {
   const { exit } = useApp();
