@@ -1,5 +1,5 @@
 {
-  "name": "@swagmanager/mcp",
+  "name": "swagmanager-mcp",
   "version": "1.0.0",
   "description": "SwagManager MCP Server — manage inventory, orders, analytics, and more from Claude Code/Desktop",
   "type": "module",
