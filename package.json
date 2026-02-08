@@ -1,7 +1,7 @@
 {
   "name": "swagmanager-mcp",
-  "version": "2.1.0",
-  "description": "SwagManager MCP Server & CLI — manage inventory, orders, analytics with AI agents from Claude Code/Desktop or the built-in chat TUI",
+  "version": "3.0.0",
+  "description": "whale code — local-first AI agent CLI for inventory, orders, and analytics powered by MCP",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

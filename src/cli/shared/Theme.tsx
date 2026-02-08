@@ -1,7 +1,8 @@
 /**
  * Theme — Apple-inspired color palette and symbols for whale CLI
  *
- * Colors based on macOS system palette (Dark mode).
+ * Colors: macOS system palette (Dark mode).
+ * Extended with purples, pinks, indigo for syntax/UI.
  * Minimal, elegant symbols — whitespace does the heavy lifting.
  */
 
@@ -15,8 +16,17 @@ export const colors = {
   brandDim:   "#0071E3",   // Apple link blue
   success:    "#30D158",   // systemGreen
   error:      "#FF453A",   // systemRed
-  warning:    "#FFD60A",   // systemYellow
+  warning:    "#FF9F0A",   // systemOrange
   info:       "#64D2FF",   // systemCyan
+
+  // Extended accents
+  pink:       "#FF375F",   // systemPink
+  purple:     "#BF5AF2",   // systemPurple
+  indigo:     "#5E5CE6",   // systemIndigo
+  mint:       "#66D4CF",   // systemMint
+  teal:       "#6AC4DC",   // systemTeal
+  lavender:   "#D4BBFF",   // lavender
+  roseGold:   "#FFB5C2",   // rose gold
 
   // Text hierarchy
   text:       "#F5F5F7",   // Apple primary text
@@ -24,20 +34,24 @@ export const colors = {
   tertiary:   "#6E6E73",   // Apple tertiary text
   quaternary: "#48484A",   // systemGray3
 
-  // Legacy aliases (keep for compatibility)
+  // Legacy aliases
   muted:      "#A1A1A6",
   dim:        "#86868B",   // systemGray
   subtle:     "#6E6E73",
   border:     "#38383A",   // systemGray5
 
   // Roles
-  user:       "#F5F5F7",   // clean white for user
+  user:       "#F5F5F7",
   assistant:  "#BF5AF2",   // systemPurple
-  tool:       "#0A84FF",   // systemBlue
+  tool:       "#0A84FF",
 
   // Tool types
-  localTool:  "#64D2FF",   // systemCyan — local ops
-  serverTool: "#FF9F0A",   // systemOrange — server/cloud
+  localTool:  "#BF5AF2",   // purple — local
+  serverTool: "#FF375F",   // pink — server/cloud
+
+  // Financial
+  gain:       "#30D158",   // systemGreen
+  loss:       "#FF453A",   // systemRed
 
   // Surfaces
   panel:      "#1C1C1E",   // systemBackground (elevated)
@@ -66,8 +80,8 @@ export const symbols = {
   assistant:  " ",
 
   // Tool types
-  localTool:  "›",
-  serverTool: "›",
+  local:      "⚡",
+  server:     "☁",
 
   // Structure
   divider:    "─",
@@ -80,7 +94,7 @@ export const symbols = {
   corner:     "└",
 
   // Brand
-  sparkle:    "whale",
+  sparkle:    "◆",
 };
 
 // ============================================================================

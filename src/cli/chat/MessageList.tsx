@@ -1,9 +1,9 @@
 /**
- * MessageList — clean conversation layout
+ * MessageList — polished conversation layout
  *
- * Apple-inspired spacing: generous whitespace, subtle separators.
- * User messages are clean, assistant responses indented.
- * Tool calls render inline with elegant minimal chrome.
+ * Generous spacing, subtle separators.
+ * Tool calls render with full syntax highlighting.
+ * Telemetry footer: tokens, cost estimate, tool count.
  */
 
 import React from "react";
@@ -38,6 +38,36 @@ interface MessageListProps {
   isStreaming: boolean;
   activeTools: ToolCall[];
   toolsExpanded: boolean;
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/** Estimate cost: Sonnet 4 pricing — $3/MTok in, $15/MTok out */
+function estimateCost(input: number, output: number): string {
+  const cost = (input * 3 + output * 15) / 1_000_000;
+  if (cost < 0.001) return "<$0.001";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(3)}`;
+}
+
+/** Format token count: 1234 → 1.2k, 12345 → 12.3k */
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+  return `${Math.round(n / 1000)}k`;
+}
+
+/** Total duration across tool calls */
+function totalToolDuration(toolCalls: ToolCall[]): number {
+  return toolCalls.reduce((sum, tc) => sum + (tc.durationMs || 0), 0);
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 1000)}s`;
 }
 
 // ============================================================================
@@ -80,12 +110,22 @@ export function MessageList({ messages, streamingText, isStreaming, activeTools,
                 </Box>
               )}
 
-              {/* Token usage — very subtle */}
+              {/* Telemetry footer */}
               {msg.usage && (
                 <Box marginLeft={2} marginTop={0}>
-                  <Text color={colors.quaternary}>
-                    {msg.usage.input_tokens.toLocaleString()}↑ {msg.usage.output_tokens.toLocaleString()}↓
+                  <Text color="#48484A">
+                    {formatTokens(msg.usage.input_tokens)}
+                    <Text color="#5E5CE6">↑</Text>
+                    {" "}{formatTokens(msg.usage.output_tokens)}
+                    <Text color="#BF5AF2">↓</Text>
                   </Text>
+                  <Text color="#38383A">  {estimateCost(msg.usage.input_tokens, msg.usage.output_tokens)}</Text>
+                  {msg.toolCalls && msg.toolCalls.length > 0 && (
+                    <Text color="#38383A">
+                      {"  "}{msg.toolCalls.length} tool{msg.toolCalls.length !== 1 ? "s" : ""}
+                      {"  "}{formatMs(totalToolDuration(msg.toolCalls))}
+                    </Text>
+                  )}
                 </Box>
               )}
             </Box>

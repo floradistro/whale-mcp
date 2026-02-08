@@ -133,6 +133,20 @@ const handlers: Record<string, ToolHandler> = {
             return { success: false, error: "inventory_id (or product_id+location_id) and adjustment required" };
           }
 
+          // STEP 1: Fetch product and location names
+          const { data: product } = await supabase
+            .from("products")
+            .select("name, sku")
+            .eq("id", productId)
+            .single();
+
+          const { data: location } = await supabase
+            .from("locations")
+            .select("name")
+            .eq("id", locationId)
+            .single();
+
+          // STEP 2: Capture BEFORE state
           const { data: current, error: fetchError } = await supabase
             .from("inventory")
             .select("quantity")
@@ -141,32 +155,94 @@ const handlers: Record<string, ToolHandler> = {
 
           if (fetchError) return { success: false, error: fetchError.message };
 
-          const newQuantity = (current?.quantity || 0) + adjustment;
+          const qtyBefore = current?.quantity || 0;
+          const qtyAfter = qtyBefore + adjustment;
 
+          if (qtyAfter < 0) {
+            return {
+              success: false,
+              error: `Cannot adjust to negative quantity: current ${qtyBefore}, adjustment ${adjustment} would result in ${qtyAfter}`
+            };
+          }
+
+          // STEP 3: Perform the adjustment
           const { data, error } = await supabase
             .from("inventory")
-            .update({ quantity: newQuantity, updated_at: new Date().toISOString() })
+            .update({ quantity: qtyAfter, updated_at: new Date().toISOString() })
             .eq("id", id)
             .select()
             .single();
 
           if (error) return { success: false, error: error.message };
-          return { success: true, data: { ...data, adjustment, reason } };
+
+          // STEP 4: Return full observability data
+          const sign = adjustment >= 0 ? "+" : "";
+          return {
+            success: true,
+            data: {
+              intent: `Adjust inventory for ${product?.name || 'product'} at ${location?.name || 'location'}: ${sign}${adjustment} units`,
+              product: product ? { id: productId, name: product.name, sku: product.sku } : { id: productId },
+              location: location ? { id: locationId, name: location.name } : { id: locationId },
+              adjustment,
+              reason,
+              before_state: { quantity: qtyBefore },
+              after_state: { quantity: qtyAfter },
+              change: { from: qtyBefore, to: qtyAfter, delta: adjustment }
+            }
+          };
         }
 
         case "set": {
           const productId = args.product_id as string;
           const locationId = args.location_id as string;
-          const quantity = args.quantity as number;
+          const newQty = args.quantity as number;
 
+          // STEP 1: Fetch product and location names
+          const { data: product } = await supabase
+            .from("products")
+            .select("name, sku")
+            .eq("id", productId)
+            .single();
+
+          const { data: location } = await supabase
+            .from("locations")
+            .select("name")
+            .eq("id", locationId)
+            .single();
+
+          // STEP 2: Capture BEFORE state
+          const { data: current } = await supabase
+            .from("inventory")
+            .select("quantity")
+            .eq("product_id", productId)
+            .eq("location_id", locationId)
+            .single();
+
+          const qtyBefore = current?.quantity || 0;
+
+          // STEP 3: Set new quantity
           const { data, error } = await supabase
             .from("inventory")
-            .upsert({ product_id: productId, location_id: locationId, quantity })
+            .upsert({ product_id: productId, location_id: locationId, quantity: newQty })
             .select()
             .single();
 
           if (error) return { success: false, error: error.message };
-          return { success: true, data };
+
+          // STEP 4: Return full observability data
+          const delta = newQty - qtyBefore;
+          const sign = delta >= 0 ? "+" : "";
+          return {
+            success: true,
+            data: {
+              intent: `Set inventory for ${product?.name || 'product'} at ${location?.name || 'location'} to ${newQty} units`,
+              product: product ? { id: productId, name: product.name, sku: product.sku } : { id: productId },
+              location: location ? { id: locationId, name: location.name } : { id: locationId },
+              before_state: { quantity: qtyBefore },
+              after_state: { quantity: newQty },
+              change: { from: qtyBefore, to: newQty, delta, description: `${sign}${delta} units` }
+            }
+          };
         }
 
         case "transfer": {
@@ -175,7 +251,26 @@ const handlers: Record<string, ToolHandler> = {
           const toLocationId = args.to_location_id as string;
           const quantity = args.quantity as number;
 
-          // Deduct from source
+          // STEP 1: Fetch product and location names
+          const { data: product } = await supabase
+            .from("products")
+            .select("name, sku")
+            .eq("id", productId)
+            .single();
+
+          const { data: fromLocation } = await supabase
+            .from("locations")
+            .select("name")
+            .eq("id", fromLocationId)
+            .single();
+
+          const { data: toLocation } = await supabase
+            .from("locations")
+            .select("name")
+            .eq("id", toLocationId)
+            .single();
+
+          // STEP 2: Capture BEFORE state
           const { data: fromInv } = await supabase
             .from("inventory")
             .select("id, quantity")
@@ -183,15 +278,6 @@ const handlers: Record<string, ToolHandler> = {
             .eq("location_id", fromLocationId)
             .single();
 
-          if (!fromInv) return { success: false, error: "Source inventory not found" };
-          if (fromInv.quantity < quantity) return { success: false, error: `Insufficient stock: have ${fromInv.quantity}, need ${quantity}` };
-
-          await supabase
-            .from("inventory")
-            .update({ quantity: fromInv.quantity - quantity })
-            .eq("id", fromInv.id);
-
-          // Add to destination (upsert)
           const { data: toInv } = await supabase
             .from("inventory")
             .select("id, quantity")
@@ -199,10 +285,27 @@ const handlers: Record<string, ToolHandler> = {
             .eq("location_id", toLocationId)
             .single();
 
+          const srcQtyBefore = fromInv?.quantity || 0;
+          const dstQtyBefore = toInv?.quantity || 0;
+
+          if (!fromInv) return { success: false, error: "Source inventory not found" };
+          if (srcQtyBefore < quantity) {
+            return {
+              success: false,
+              error: `Insufficient stock at ${fromLocation?.name || fromLocationId}: have ${srcQtyBefore}, need ${quantity}`
+            };
+          }
+
+          // STEP 3: Perform the transfer
+          await supabase
+            .from("inventory")
+            .update({ quantity: srcQtyBefore - quantity })
+            .eq("id", fromInv.id);
+
           if (toInv) {
             await supabase
               .from("inventory")
-              .update({ quantity: toInv.quantity + quantity })
+              .update({ quantity: dstQtyBefore + quantity })
               .eq("id", toInv.id);
           } else {
             await supabase
@@ -210,7 +313,31 @@ const handlers: Record<string, ToolHandler> = {
               .insert({ product_id: productId, location_id: toLocationId, quantity });
           }
 
-          return { success: true, data: { transferred: quantity, from: fromLocationId, to: toLocationId, product_id: productId } };
+          // STEP 4: Calculate AFTER state
+          const srcQtyAfter = srcQtyBefore - quantity;
+          const dstQtyAfter = dstQtyBefore + quantity;
+
+          // STEP 5: Return full observability data
+          return {
+            success: true,
+            data: {
+              intent: `Transfer ${quantity} units of ${product?.name || 'product'} from ${fromLocation?.name || 'source'} to ${toLocation?.name || 'destination'}`,
+              product: product ? { id: productId, name: product.name, sku: product.sku } : { id: productId },
+              from_location: fromLocation ? { id: fromLocationId, name: fromLocation.name } : { id: fromLocationId },
+              to_location: toLocation ? { id: toLocationId, name: toLocation.name } : { id: toLocationId },
+              quantity_transferred: quantity,
+              before_state: {
+                from_quantity: srcQtyBefore,
+                to_quantity: dstQtyBefore,
+                total: srcQtyBefore + dstQtyBefore
+              },
+              after_state: {
+                from_quantity: srcQtyAfter,
+                to_quantity: dstQtyAfter,
+                total: srcQtyAfter + dstQtyAfter
+              }
+            }
+          };
         }
 
         case "bulk_adjust": {

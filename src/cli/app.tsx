@@ -24,6 +24,8 @@ export async function renderLogout(): Promise<void> {
 }
 
 export async function renderChat(): Promise<void> {
+  const { matrixIntro } = await import("./shared/MatrixIntro.js");
+  await matrixIntro();
   const { ChatApp } = await import("./chat/ChatApp.js");
   const { waitUntilExit } = render(<ChatApp />);
   await waitUntilExit();
@@ -38,5 +40,11 @@ export async function renderSetup(): Promise<void> {
 export async function renderStatus(): Promise<void> {
   const { StatusApp } = await import("./status/StatusApp.js");
   const { waitUntilExit } = render(<StatusApp />);
+  await waitUntilExit();
+}
+
+export async function renderStores(): Promise<void> {
+  const { StoreApp } = await import("./stores/StoreApp.js");
+  const { waitUntilExit } = render(<StoreApp />);
   await waitUntilExit();
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * whale — local-first AI agent CLI
+ * whale code — local-first AI agent CLI
  *
  * Usage:
  *   whale              — Start chat (default, interactive terminal)
@@ -31,7 +31,7 @@ function showHelp() {
   console.log();
   console.log(`  ${g}╭──────────────────────────────────────────╮${r}`);
   console.log(`  ${g}│${r}                                          ${g}│${r}`);
-  console.log(`  ${g}│${r}   ${c}${B}◆ whale${r}  ${d}v2.1.0${r}                         ${g}│${r}`);
+  console.log(`  ${g}│${r}   ${c}${B}◆ whale code${r}  ${d}v3.0.0${r}                    ${g}│${r}`);
   console.log(`  ${g}│${r}   ${d}local-first AI agent CLI${r}               ${g}│${r}`);
   console.log(`  ${g}│${r}                                          ${g}│${r}`);
   console.log(`  ${g}╰──────────────────────────────────────────╯${r}`);
@@ -40,6 +40,7 @@ function showHelp() {
   console.log(`    whale${d}             Start chatting (default)${r}`);
   console.log(`    whale login${d}       Log in to SwagManager${r}`);
   console.log(`    whale logout${d}      Clear session${r}`);
+  console.log(`    whale stores${d}      Switch active store${r}`);
   console.log(`    whale status${d}      Connection & tools${r}`);
   console.log(`    whale setup${d}       Install MCP to IDEs${r}`);
   console.log();
@@ -101,6 +102,17 @@ switch (command) {
     }
     const { renderSetup } = await import(join(__dirname, "..", "dist", "cli", "app.js"));
     await renderSetup();
+    break;
+  }
+
+  case "stores":
+  case "store": {
+    if (!process.stdin.isTTY) {
+      console.error("Error: whale stores requires an interactive terminal.");
+      process.exit(1);
+    }
+    const { renderStores } = await import(join(__dirname, "..", "dist", "cli", "app.js"));
+    await renderStores();
     break;
   }
 

@@ -83,7 +83,7 @@ const SERVER_TOOLS_DESC = `You also have server tools for managing the business:
 Server tools use an "action" parameter to select the operation.`;
 
 function buildSystemPrompt(hasServerTools: boolean): string {
-  let prompt = `You are whale, a CLI AI assistant similar to Claude Code.\n\n${LOCAL_TOOLS_DESC}`;
+  let prompt = `You are whale code, a CLI AI assistant similar to Claude Code.\n\n${LOCAL_TOOLS_DESC}`;
   if (hasServerTools) {
     prompt += `\n\n${SERVER_TOOLS_DESC}`;
   }

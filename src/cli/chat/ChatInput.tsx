@@ -1,9 +1,8 @@
 /**
- * ChatInput — input with slash command popup menu
+ * ChatInput — clean input with slash command menu
  *
- * When the input value is exactly "/", the text input is hidden
- * and replaced with a SelectInput menu. Arrow keys + Enter to pick.
- * Esc or backspace closes the menu.
+ * "/" triggers a select menu. Esc/backspace dismisses.
+ * Minimal chrome, Apple-style focus states.
  */
 
 import React, { useState } from "react";
@@ -20,11 +19,13 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/help",   description: "Show available commands" },
-  { name: "/tools",  description: "List all tools (local + server)" },
-  { name: "/mcp",    description: "MCP server connection status" },
-  { name: "/status", description: "Show status" },
+  { name: "/tools",  description: "List all tools" },
+  { name: "/mcp",    description: "Server connection status" },
+  { name: "/store",  description: "Switch active store" },
+  { name: "/status", description: "Show session info" },
+  { name: "/update", description: "Check for updates & install" },
   { name: "/clear",  description: "Clear conversation" },
-  { name: "/exit",   description: "Exit whale" },
+  { name: "/exit",   description: "Exit" },
 ];
 
 interface ChatInputProps {
@@ -38,10 +39,8 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
   const [value, setValue] = useState("");
   const [menuMode, setMenuMode] = useState(false);
 
-  // Watch for "/" typed into the text input
   const handleChange = (newValue: string) => {
     if (newValue === "/") {
-      // Switch to menu mode
       setMenuMode(true);
       setValue("");
       return;
@@ -49,7 +48,6 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
     setValue(newValue);
   };
 
-  // Close menu on Esc or backspace when in menu mode
   useInput((input, key) => {
     if (!menuMode || disabled) return;
     if (key.escape || key.delete || key.backspace) {
@@ -70,16 +68,16 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
     setValue("");
   };
 
+  // Thinking state — smooth spinner
   if (disabled) {
     return (
       <Box>
         <Text color={colors.brand}><Spinner type="dots" /></Text>
-        <Text color={colors.muted}> thinking...</Text>
       </Box>
     );
   }
 
-  // Menu mode: show selectable command list
+  // Slash command menu
   if (menuMode) {
     const items = SLASH_COMMANDS.map((c) => ({
       label: c.name,
@@ -88,37 +86,32 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
 
     return (
       <Box flexDirection="column">
-        <Box marginBottom={1}>
-          <Text color={colors.dim}>Select a command:</Text>
-        </Box>
         <SelectInput
           items={items}
           onSelect={handleMenuSelect}
           indicatorComponent={({ isSelected }) => (
-            <Text color={isSelected ? colors.brand : colors.dim}>
-              {isSelected ? symbols.arrowRight : " "}{" "}
+            <Text color={isSelected ? colors.brand : colors.quaternary}>
+              {isSelected ? "›" : " "}{" "}
             </Text>
           )}
           itemComponent={({ isSelected, label }) => {
             const cmd = SLASH_COMMANDS.find((c) => c.name === label);
             return (
               <Box>
-                <Text color={isSelected ? colors.brand : colors.text} bold={isSelected}>
+                <Text color={isSelected ? colors.brand : colors.secondary} bold={isSelected}>
                   {label}
                 </Text>
-                <Text color={colors.dim}>  {cmd?.description}</Text>
+                <Text color={colors.tertiary}>  {cmd?.description}</Text>
               </Box>
             );
           }}
         />
-        <Box marginTop={1}>
-          <Text color={colors.subtle}>esc to cancel</Text>
-        </Box>
+        <Text color={colors.quaternary}>  esc to dismiss</Text>
       </Box>
     );
   }
 
-  // Normal input mode
+  // Normal input
   return (
     <Box>
       <Text color={colors.brand} bold>{symbols.user} </Text>
@@ -126,7 +119,7 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
         value={value}
         onChange={handleChange}
         onSubmit={handleSubmit}
-        placeholder={agentName ? `Message ${agentName}, or type /` : "Type a message, or /"}
+        placeholder={`Message ${agentName || "whale"}, or /`}
       />
     </Box>
   );
