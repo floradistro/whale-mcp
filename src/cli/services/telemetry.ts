@@ -158,7 +158,7 @@ async function _logSpan(opts: SpanOptions): Promise<void> {
     conversation_id: ctx.conversationId || null,
 
     details: {
-      source: "whale-cli",
+      source: "whale_mcp",
       conversation_id: conversationId,
       turn_number: turnNumber,
       ...opts.details,

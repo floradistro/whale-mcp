@@ -151,8 +151,13 @@ marked.use(
 
       // Lists — purple bullets, financial-aware
       list: (body: string, ordered: boolean) => {
-        if (ordered) return body;
-        // Replace default * bullets with styled ●
+        if (ordered) {
+          let n = 0;
+          return body.replace(/^\* /gm, () => {
+            n++;
+            return `${systemIndigo(String(n) + ".")} `;
+          });
+        }
         return body.replace(/^\* /gm, `${systemPurple("●")} `);
       },
       listitem: (itemText: string) => {

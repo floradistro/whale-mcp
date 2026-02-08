@@ -419,12 +419,18 @@ export async function executeServerTool(
   }
 
   try {
+    // Ensure source is always set to "whale_mcp" for MCP server tools
+    const enrichedContext: ExecutionContext = {
+      ...context,
+      source: context?.source || "whale_mcp"
+    };
+
     const result: ServerToolResult = await executeTool(
       conn.client,
       name,
       input,
       conn.storeId || undefined,
-      context
+      enrichedContext
     );
 
     if (result.success) {

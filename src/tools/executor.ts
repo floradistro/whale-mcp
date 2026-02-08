@@ -2616,7 +2616,7 @@ export type SpanKind = "CLIENT" | "SERVER" | "INTERNAL" | "PRODUCER" | "CONSUMER
 
 export interface ExecutionContext {
   // Basic identification
-  source: "claude_code" | "swag_manager" | "api" | "edge_function" | "mcp" | "test";
+  source: "claude_code" | "swag_manager" | "api" | "edge_function" | "mcp" | "test" | "whale_mcp";
   userId?: string;
   userEmail?: string;
 
