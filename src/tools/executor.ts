@@ -2491,6 +2491,7 @@ export interface ExecutionContext {
   // Basic identification
   source: "claude_code" | "swag_manager" | "api" | "edge_function" | "mcp" | "test";
   userId?: string;
+  userEmail?: string;
 
   // W3C Trace Context fields
   traceId?: string;      // W3C trace-id: 32 lowercase hex chars
@@ -2583,6 +2584,7 @@ async function logToolExecution(
       severity: result.success ? "info" : "error",
       store_id: storeId || null,
       user_id: context?.userId || null,
+      user_email: context?.userEmail || null,
       resource_type: "mcp_tool",
       resource_id: toolName,
       request_id: context?.requestId || traceId,

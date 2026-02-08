@@ -18,6 +18,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient } from "@supabase/supabase-js";
 import { executeTool, getImplementedTools } from "./tools/executor.js";
+import { startUpdateLoop } from "./updater.js";
 
 // ============================================================================
 // CONFIGURATION
@@ -172,6 +173,9 @@ async function main() {
   // Pre-load tools
   const tools = await loadToolDefinitions(true);
   console.error(`[MCP] Loaded ${tools.length} tools`);
+
+  // Start OTA update checker (non-blocking, runs in background)
+  startUpdateLoop(true);
 
   // Connect via stdio
   const transport = new StdioServerTransport();
