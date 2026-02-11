@@ -102,6 +102,12 @@ function formatContext(name: string, input?: Record<string, unknown>): string {
     const model = input.model || "sonnet";
     return `${type} (${model})`;
   }
+  if (name === "lsp") {
+    const op = input.operation || "";
+    const fp = input.filePath ? shortenPath(String(input.filePath)) : "";
+    const ln = input.line ? `:${input.line}` : "";
+    return `${op} ${fp}${ln}`;
+  }
 
   // Server tools → action + key param
   if (input.action) {
@@ -131,7 +137,7 @@ const LANG_MAP: Record<string, string> = {
 // TOOL CATEGORIES — unique icon + color per tool type
 // ============================================================================
 
-type ToolCategory = "read" | "write" | "edit" | "search" | "command" | "directory" | "web" | "agent" | "todo" | "notebook" | "server";
+type ToolCategory = "read" | "write" | "edit" | "search" | "command" | "directory" | "web" | "agent" | "todo" | "notebook" | "server" | "lsp";
 
 interface CategoryStyle {
   icon: string;
@@ -150,6 +156,7 @@ const CATEGORY_STYLES: Record<ToolCategory, CategoryStyle> = {
   todo:      { icon: "☐", color: "#30D158" },   // green
   notebook:  { icon: "◫", color: "#FF9F0A" },   // orange
   server:    { icon: "▹", color: "#FF375F" },   // pink
+  lsp:       { icon: "⊞", color: "#64D2FF" },   // cyan
 };
 
 const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
@@ -167,13 +174,16 @@ const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
   web_search: "web",
   task: "agent",
   team_create: "agent",
-  todo_write: "todo",
+  tasks: "todo",
+  config: "command",
+  ask_user: "command",
   bash_output: "command",
   kill_shell: "command",
   list_shells: "command",
   notebook_edit: "notebook",
   task_output: "agent",
   task_stop: "agent",
+  lsp: "lsp",
 };
 
 function getToolCategory(name: string): ToolCategory {
@@ -196,13 +206,16 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   web_search: "WebSearch",
   task: "Task",
   team_create: "Team",
-  todo_write: "TodoWrite",
+  tasks: "Tasks",
+  config: "Config",
+  ask_user: "AskUser",
   bash_output: "TaskOutput",
   kill_shell: "TaskStop",
   list_shells: "Tasks",
   notebook_edit: "NotebookEdit",
   task_output: "TaskOutput",
   task_stop: "TaskStop",
+  lsp: "LSP",
 };
 
 export function getDisplayName(name: string): string {
@@ -266,7 +279,13 @@ function wrapInFence(content: string, lang: string, subtitle?: string): string {
 export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, status, result, input, durationMs, expanded = false }: ToolIndicatorProps) {
   const context = useMemo(() => formatContext(name, input), [name, input]);
   const lineCount = useMemo(() => result ? result.split("\n").length : 0, [result]);
-  const lang = useMemo(() => detectLang(name, input), [name, input]);
+  // Detect lang — writes with diffs get "diff" treatment
+  const lang = useMemo(() => {
+    const base = detectLang(name, input);
+    if (base) return base;
+    if (name === "write_file" && result?.includes("\n@@")) return "diff";
+    return base;
+  }, [name, input, result]);
 
   // Category-based styling
   const category = getToolCategory(name);
@@ -289,6 +308,11 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
     }
 
     if (category === "write") {
+      // Overwrite with diff — show +N -N badge
+      const diffMatch = result.match(/Added (\d+) lines?, removed (\d+) lines?/i);
+      if (diffMatch) {
+        return { type: "edit" as const, added: parseInt(diffMatch[1]), removed: parseInt(diffMatch[2]) };
+      }
       const lineMatch = result.match(/\((\d+) lines?, (\d+) chars\)/);
       if (lineMatch) {
         const lines = parseInt(lineMatch[1]);
@@ -398,7 +422,9 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
   const isShort = lineCount <= AUTO_EXPAND_THRESHOLD;
   // Read/write results stay collapsed (just header line) — Claude Code parity.
   // Edit/search/command results auto-expand if short enough.
-  const collapseByDefault = category === "read" || category === "write" || category === "directory";
+  // Writes with diffs auto-expand like edits.
+  const hasDiff = lang === "diff";
+  const collapseByDefault = category === "read" || (category === "write" && !hasDiff) || category === "directory";
   const showFull = hasResult && (expanded || (isShort && !collapseByDefault));
 
   return (
@@ -414,8 +440,8 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
             ? <Text color="#FF9F0A">  {formatDuration(durationMs)}</Text>
             : <Text dimColor>  {formatDuration(durationMs)}</Text>
         )}
-        {/* Inline summary badges */}
-        {summary?.type === "edit" && (
+        {/* Inline summary badges — edits only (writes use tree line below) */}
+        {summary?.type === "edit" && category === "edit" && (
           <>
             <Text color="#30D158">  +{summary.added}</Text>
             <Text color="#FF453A"> -{summary.removed}</Text>
@@ -432,6 +458,15 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
         )}
         {!summary && hasResult && !showFull && <Text dimColor>  {lineCount} lines</Text>}
       </Box>
+
+      {/* Write diff summary tree line */}
+      {category === "write" && hasDiff && summary?.type === "edit" && (
+        <Box marginLeft={2}>
+          <Text dimColor>└ Added </Text><Text color="#30D158">{summary.added}</Text>
+          <Text dimColor> lines, removed </Text><Text color="#FF453A">{summary.removed}</Text>
+          <Text dimColor> lines</Text>
+        </Box>
+      )}
 
       {/* Result — full, syntax highlighted */}
       {showFull && (

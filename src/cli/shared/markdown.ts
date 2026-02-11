@@ -200,11 +200,8 @@ marked.use(
 // Background colors for diff lines
 const diffAddedBg    = chalk.bgHex("#1a3a2a").hex("#69DB7C");  // green bg, bright green text
 const diffRemovedBg  = chalk.bgHex("#3a1a1e").hex("#FFA8B4");  // red bg, pink text
-const diffAddedDim   = chalk.bgHex("#0d1f14").hex("#4a9e5a");  // dimmed green
-const diffRemovedDim = chalk.bgHex("#1f0d10").hex("#9e4a53");  // dimmed red
 const diffWordAdded  = chalk.bgHex("#2F9D44").hex("#FFFFFF");  // bright green bg for changed words
 const diffWordRemoved = chalk.bgHex("#D1454B").hex("#FFFFFF"); // bright red bg for changed words
-const dashBorder     = chalk.hex("#48484A");
 
 /** Compute word-level diff between two lines. Returns arrays of {text, changed} segments. */
 function wordDiff(oldLine: string, newLine: string): { old: {text: string; changed: boolean}[]; new: {text: string; changed: boolean}[] } {
@@ -252,65 +249,128 @@ function renderSegments(segs: {text: string; changed: boolean}[], wordStyle: (s:
 
 function renderDiff(code: string): string {
   const lines = code.split("\n");
-  const gutterW = String(lines.length).length;
-  const termWidth = Math.min(120, process.stdout.columns || 80);
-  const contentWidth = termWidth - 4 - gutterW - 3; // indent + gutter + " │ "
-  const out: string[] = [];
-  let added = 0, removed = 0;
+  const termWidth = (process.stdout.columns || 80) - 2; // -2 for Box marginLeft
 
-  // Dashed top border
-  const dashLine = "  " + dashBorder("┄".repeat(Math.min(50, termWidth - 4)));
+  // Parse into segments from unified diff format
+  type Seg = { type: "remove" | "add" | "context"; content: string; lineNo: number };
+  const segments: Seg[] = [];
+  let oldLineNo = 1, newLineNo = 1;
+  let seenDiff = false;
 
-  // Pair adjacent -/+ lines for word-level diff
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const ln = tertiary(String(i + 1).padStart(gutterW)) + separator(" │ ");
+  for (const line of lines) {
+    // Skip file headers (--- a/file, +++ b/file)
+    if (line.startsWith("---") || line.startsWith("+++")) continue;
 
-    if (line.startsWith("+")) {
-      // Check if previous line was a removal for word-level diff
-      const prevIdx = out.length > 0 ? i - 1 : -1;
-      const prevLine = prevIdx >= 0 ? lines[prevIdx] : null;
+    // Hunk header — extract line numbers
+    const hunkMatch = line.match(/^@@\s*-(\d+)(?:,\d+)?\s*\+(\d+)(?:,\d+)?\s*@@/);
+    if (hunkMatch) {
+      oldLineNo = parseInt(hunkMatch[1]);
+      newLineNo = parseInt(hunkMatch[2]);
+      seenDiff = true;
+      continue;
+    }
 
-      if (prevLine?.startsWith("-") && added > 0) {
-        // Word-level diff: re-render previous removal + this addition
-        const wd = wordDiff(prevLine.slice(1), line.slice(1));
-        const prevRendered = "  " + tertiary(String(i).padStart(gutterW)) + separator(" │ ") +
-          diffRemovedBg("-") + renderSegments(wd.old, diffWordRemoved, diffRemovedBg);
-        out[out.length - 1] = prevRendered; // Replace the previous line
-        const pad = Math.max(0, contentWidth - line.length);
-        out.push("  " + ln + diffAddedBg("+") + renderSegments(wd.new, diffWordAdded, diffAddedBg) + diffAddedBg(" ".repeat(pad)));
-      } else {
-        const pad = Math.max(0, contentWidth - line.length);
-        out.push("  " + ln + diffAddedBg(line) + diffAddedBg(" ".repeat(pad)));
-      }
-      added++;
-    } else if (line.startsWith("-")) {
-      const pad = Math.max(0, contentWidth - line.length);
-      out.push("  " + ln + diffRemovedBg(line) + diffRemovedBg(" ".repeat(pad)));
-      removed++;
-    } else if (line.startsWith("@@")) {
-      out.push("  " + ln + systemCyan(line));
+    // Skip non-diff header lines (e.g., "File edited:", "Applied N edits")
+    if (!seenDiff && !line.startsWith("-") && !line.startsWith("+") && !line.startsWith(" ")) {
+      continue;
+    }
+    seenDiff = true;
+
+    if (line.startsWith("-")) {
+      segments.push({ type: "remove", content: line.slice(1), lineNo: oldLineNo });
+      oldLineNo++;
+    } else if (line.startsWith("+")) {
+      segments.push({ type: "add", content: line.slice(1), lineNo: newLineNo });
+      newLineNo++;
     } else {
-      out.push("  " + ln + diffAddedDim(line));
+      const content = line.startsWith(" ") ? line.slice(1) : line;
+      segments.push({ type: "context", content, lineNo: newLineNo });
+      oldLineNo++;
+      newLineNo++;
     }
   }
 
-  // Header with counts
-  const counts = (added > 0 || removed > 0)
-    ? " " + systemGreen(`+${added}`) + " " + systemRed(`-${removed}`) + " "
-    : " ";
-  const label = tertiary("diff");
-  const usedLen = 5 + 4 + (added > 0 || removed > 0 ? 4 + String(added).length + String(removed).length : 0);
-  const pad = Math.max(2, 48 - usedLen);
-  const header = separator("  ── ") + label + counts + separator("─".repeat(pad));
+  if (segments.length === 0) return code; // fallback
 
-  // Count summary line
-  const summaryParts: string[] = [];
-  if (added > 0) summaryParts.push(chalk.bold.hex("#69DB7C")(`${added} added`));
-  if (removed > 0) summaryParts.push(chalk.bold.hex("#FFA8B4")(`${removed} removed`));
-  const summary = summaryParts.length > 0 ? "  " + tertiary("  ") + summaryParts.join(tertiary(", ")) : "";
+  // Gutter width from max line number
+  const maxLineNo = segments.reduce((max, s) => Math.max(max, s.lineNo), 0);
+  const gutterW = Math.max(3, String(maxLineNo).length);
 
-  return "\n" + header + "\n" + dashLine + "\n" + out.join("\n") + "\n" + dashLine + summary + "\n";
+  const out: string[] = [];
+  let i = 0;
+
+  while (i < segments.length) {
+    const seg = segments[i];
+
+    if (seg.type === "remove") {
+      // Collect consecutive removes
+      const removes: Seg[] = [];
+      while (i < segments.length && segments[i].type === "remove") {
+        removes.push(segments[i]);
+        i++;
+      }
+      // Collect consecutive adds
+      const adds: Seg[] = [];
+      while (i < segments.length && segments[i].type === "add") {
+        adds.push(segments[i]);
+        i++;
+      }
+
+      // Pair for word-level diff
+      const pairCount = Math.min(removes.length, adds.length);
+
+      for (let j = 0; j < removes.length; j++) {
+        const r = removes[j];
+        const rPrefix = `${String(r.lineNo).padStart(gutterW)} - `;
+
+        if (j < pairCount) {
+          const a = adds[j];
+          const aPrefix = `${String(a.lineNo).padStart(gutterW)} + `;
+          const wd = wordDiff(r.content, a.content);
+
+          // Removed line with word highlights
+          const rPad = Math.max(0, termWidth - rPrefix.length - r.content.length);
+          out.push(diffRemovedBg(rPrefix) + renderSegments(wd.old, diffWordRemoved, diffRemovedBg) + diffRemovedBg(" ".repeat(rPad)));
+
+          // Added line with word highlights
+          const aPad = Math.max(0, termWidth - aPrefix.length - a.content.length);
+          out.push(diffAddedBg(aPrefix) + renderSegments(wd.new, diffWordAdded, diffAddedBg) + diffAddedBg(" ".repeat(aPad)));
+        } else {
+          // Unpaired remove
+          const raw = rPrefix + r.content;
+          const pad = Math.max(0, termWidth - raw.length);
+          out.push(diffRemovedBg(raw + " ".repeat(pad)));
+        }
+      }
+
+      // Unpaired adds
+      for (let j = pairCount; j < adds.length; j++) {
+        const a = adds[j];
+        const prefix = `${String(a.lineNo).padStart(gutterW)} + `;
+        const raw = prefix + a.content;
+        const pad = Math.max(0, termWidth - raw.length);
+        out.push(diffAddedBg(raw + " ".repeat(pad)));
+      }
+      continue;
+    }
+
+    if (seg.type === "add") {
+      // Standalone add (no preceding remove)
+      const prefix = `${String(seg.lineNo).padStart(gutterW)} + `;
+      const raw = prefix + seg.content;
+      const pad = Math.max(0, termWidth - raw.length);
+      out.push(diffAddedBg(raw + " ".repeat(pad)));
+      i++;
+      continue;
+    }
+
+    // Context line — dim line number, plain content, no background
+    const prefix = tertiary(`${String(seg.lineNo).padStart(gutterW)}   `);
+    out.push(prefix + seg.content);
+    i++;
+  }
+
+  return out.join("\n") + "\n";
 }
 
 // ============================================================================

@@ -9,7 +9,7 @@
  *   - grep:            regex search with context, output modes (new)
  *   - notebook_edit:   Jupyter notebook cell editing (new)
  *   - web_fetch:       fetch URL content as markdown (new)
- *   - todo_write:      session todo list (new)
+ *   - tasks:           action-based CRUD task tracking (replaces todo_write)
  *
  * Original tools (search_files, search_content, list_directory) kept for compat.
  */
@@ -38,6 +38,26 @@ import { spawnBackground, readProcessOutput, killProcess, listProcesses, readAge
 import { getGlobalEmitter } from "./agent-events.js";
 import { getValidToken, SUPABASE_URL, createAuthenticatedClient } from "./auth-service.js";
 import { resolveConfig } from "./config-store.js";
+import { executeLSP, notifyFileChanged } from "./lsp-manager.js";
+// Lazy import to avoid circular dependency — agent-loop imports local-tools
+let _agentLoopExports: {
+  setPermissionMode: (mode: "default" | "plan" | "yolo") => { success: boolean; message: string };
+  getPermissionMode: () => "default" | "plan" | "yolo";
+  getModel: () => string;
+  setModel: (name: string) => { success: boolean; model: string };
+} | null = null;
+async function getAgentLoop() {
+  if (!_agentLoopExports) {
+    const mod = await import("./agent-loop.js");
+    _agentLoopExports = {
+      setPermissionMode: mod.setPermissionMode,
+      getPermissionMode: mod.getPermissionMode,
+      getModel: mod.getModel,
+      setModel: mod.setModel,
+    };
+  }
+  return _agentLoopExports;
+}
 
 // ============================================================================
 // TYPES
@@ -62,7 +82,22 @@ export interface ToolResult {
 // IN-MEMORY STATE (persists across turns within a session)
 // ============================================================================
 
-let todoState: Array<{ id: string; content: string; status: string; activeForm?: string }> = [];
+// Task state — replaces old todoState with ID-based tasks supporting dependencies
+interface TaskItem {
+  id: string;
+  subject: string;
+  description: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+  owner?: string;
+  metadata?: Record<string, unknown>;
+  blocks: string[];    // task IDs this task blocks
+  blockedBy: string[]; // task IDs that must complete before this one
+  createdAt: string;
+}
+
+let taskState: TaskItem[] = [];
+let taskCounter = 0;
 let todoSessionId: string | null = null;
 const TODOS_DIR = join(homedir(), ".swagmanager", "todos");
 
@@ -84,7 +119,7 @@ export const LOCAL_TOOL_NAMES = new Set([
   "grep",
   "notebook_edit",
   "web_fetch",
-  "todo_write",
+  "tasks", // Replaces todo_write — action-based CRUD with IDs, deps
   "multi_edit", // Multi-edit tool
   "task", // Subagent tool
   "team_create", // Agent team tool
@@ -97,6 +132,11 @@ export const LOCAL_TOOL_NAMES = new Set([
   "task_stop",
   // Web search
   "web_search",
+  // Claude Code parity — consolidated tools
+  "config", // Settings + plan mode
+  "ask_user", // Structured questions
+  // Code intelligence
+  "lsp",
 ]);
 
 export function isLocalTool(name: string): boolean {
@@ -243,6 +283,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
         case_insensitive: { type: "boolean", description: "Case insensitive search (default false)" },
         type: { type: "string", description: "File type shorthand: js, ts, py, go, rust, java, etc." },
         head_limit: { type: "number", description: "Max results to return (default 200)" },
+        offset: { type: "number", description: "Skip first N entries before applying head_limit (default 0)" },
         multiline: { type: "boolean", description: "Enable multiline mode where . matches newlines (requires rg)" },
       },
       required: ["pattern"],
@@ -294,35 +335,41 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
       type: "object",
       properties: {
         query: { type: "string", description: "Search query" },
+        allowed_domains: { type: "array", items: { type: "string" }, description: "Only include results from these domains" },
+        blocked_domains: { type: "array", items: { type: "string" }, description: "Exclude results from these domains" },
       },
       required: ["query"],
     },
   },
 
   // ------------------------------------------------------------------
-  // NEW: TODO_WRITE — session task tracking
+  // TASKS — action-based CRUD for structured task tracking
   // ------------------------------------------------------------------
   {
-    name: "todo_write",
-    description: "Manage a todo list for the current session. Track tasks with status.",
+    name: "tasks",
+    description: "Track tasks for the current session. Actions: create (returns ID), update (status/deps), list (summary), get (full details). Supports dependencies via blocks/blockedBy.",
     input_schema: {
       type: "object",
       properties: {
-        todos: {
-          type: "array",
-          description: "Full todo list (replaces existing). Each item: {content, status, activeForm?}",
-          items: {
-            type: "object",
-            properties: {
-              content: { type: "string", description: "Task description" },
-              status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Task status" },
-              activeForm: { type: "string", description: "Present-tense form shown while in progress" },
-            },
-            required: ["content", "status"],
-          },
+        action: {
+          type: "string",
+          enum: ["create", "update", "list", "get"],
+          description: "Action to perform",
         },
+        // For create:
+        subject: { type: "string", description: "Brief title in imperative form (create)" },
+        description: { type: "string", description: "Detailed description (create/update)" },
+        activeForm: { type: "string", description: "Present continuous spinner text (create/update)" },
+        metadata: { type: "object", description: "Arbitrary metadata (create/update)" },
+        // For update/get:
+        taskId: { type: "string", description: "Task ID (update/get)" },
+        status: { type: "string", enum: ["pending", "in_progress", "completed", "deleted"], description: "New status (update)" },
+        subject_update: { type: "string", description: "New subject (update)" },
+        addBlocks: { type: "array", items: { type: "string" }, description: "Task IDs this task blocks (update)" },
+        addBlockedBy: { type: "array", items: { type: "string" }, description: "Task IDs that block this task (update)" },
+        owner: { type: "string", description: "Task owner (update)" },
       },
-      required: ["todos"],
+      required: ["action"],
     },
   },
   // ------------------------------------------------------------------
@@ -386,6 +433,15 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
         description: {
           type: "string",
           description: "Short 3-5 word description of the task.",
+        },
+        team_name: {
+          type: "string",
+          description: "Team name for spawning. Uses current team context if omitted.",
+        },
+        mode: {
+          type: "string",
+          enum: ["default", "plan", "yolo"],
+          description: "Permission mode for spawned agent (default inherits parent).",
         },
       },
       required: ["prompt", "subagent_type"],
@@ -504,6 +560,82 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
       required: ["task_id"],
     },
   },
+
+  // ------------------------------------------------------------------
+  // CONFIG — runtime settings + mode control (consolidated)
+  // ------------------------------------------------------------------
+  {
+    name: "config",
+    description: "Read or write CLI settings. Omit value to read. Keys: model (sonnet/opus/haiku), mode (default/plan/yolo — plan restricts to read-only tools), memory. Use mode=plan before non-trivial tasks to explore first, mode=default to resume full access.",
+    input_schema: {
+      type: "object",
+      properties: {
+        setting: { type: "string", description: "Setting key: 'model', 'mode', 'memory'" },
+        value: { type: "string", description: "New value. Omit to read current value." },
+      },
+      required: ["setting"],
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // LSP — Language Server Protocol code intelligence
+  // ------------------------------------------------------------------
+  {
+    name: "lsp",
+    description: "Code intelligence via Language Server Protocol. Supports: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls. Requires a language server installed for the file type.",
+    input_schema: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: [
+            "goToDefinition",
+            "findReferences",
+            "hover",
+            "documentSymbol",
+            "workspaceSymbol",
+            "goToImplementation",
+            "prepareCallHierarchy",
+            "incomingCalls",
+            "outgoingCalls",
+          ],
+          description: "LSP operation to perform",
+        },
+        filePath: { type: "string", description: "Absolute or relative path to the file" },
+        line: { type: "number", description: "Line number (1-based, as shown in editors)" },
+        character: { type: "number", description: "Character offset (1-based, as shown in editors)" },
+        query: { type: "string", description: "Search query for workspaceSymbol operation (optional, defaults to all symbols)" },
+      },
+      required: ["operation", "filePath", "line", "character"],
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // ASK_USER — structured multi-choice question
+  // ------------------------------------------------------------------
+  {
+    name: "ask_user",
+    description: "Ask the user a structured question with predefined options. Use to gather preferences, clarify requirements, or get decisions during execution. The user can always type a custom answer.",
+    input_schema: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "The question to ask" },
+        options: {
+          type: "array",
+          description: "2-4 options for the user to choose from",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "Short option label (1-5 words)" },
+              description: { type: "string", description: "Explanation of what this option means" },
+            },
+            required: ["label", "description"],
+          },
+        },
+      },
+      required: ["question", "options"],
+    },
+  },
 ];
 
 // ============================================================================
@@ -543,12 +675,16 @@ export async function executeLocalTool(
       case "notebook_edit":   return notebookEdit(input);
       case "web_fetch":       return await webFetch(input);
       case "web_search":      return await webSearch(input);
-      case "todo_write":      return todoWrite(input);
+      case "tasks":           return tasksTool(input);
       case "multi_edit":      return multiEdit(input);
       case "task":            return await taskTool(input);
       case "team_create":     return await teamCreateTool(input);
       case "task_output":     return await taskOutput(input);
       case "task_stop":       return taskStop(input);
+      // Claude Code parity (consolidated)
+      case "config":          return await configTool(input);
+      case "ask_user":        return askUser(input);
+      case "lsp":             return await lspTool(input);
       default:                return { success: false, output: `Unknown local tool: ${name}` };
     }
   } catch (err) {
@@ -652,23 +788,108 @@ function parsePageRange(range: string, totalPages: number): { start: number; end
   return { start, end };
 }
 
+/** Compute a unified diff between old and new file lines using prefix/suffix matching */
+function computeWriteDiff(oldLines: string[], newLines: string[]): string[] {
+  const CTX = 3;
+  const MAX_PER_SIDE = 60;
+
+  // Find common prefix
+  let prefixLen = 0;
+  while (prefixLen < oldLines.length && prefixLen < newLines.length &&
+         oldLines[prefixLen] === newLines[prefixLen]) {
+    prefixLen++;
+  }
+
+  // Find common suffix (not overlapping prefix)
+  let suffixLen = 0;
+  while (suffixLen < (oldLines.length - prefixLen) &&
+         suffixLen < (newLines.length - prefixLen) &&
+         oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]) {
+    suffixLen++;
+  }
+
+  // If identical
+  if (prefixLen + suffixLen >= oldLines.length && prefixLen + suffixLen >= newLines.length) {
+    return []; // no changes
+  }
+
+  const oldMiddle = oldLines.slice(prefixLen, oldLines.length - suffixLen);
+  const newMiddle = newLines.slice(prefixLen, newLines.length - suffixLen);
+
+  // If most of the file changed, show a compact summary
+  if (oldMiddle.length > MAX_PER_SIDE * 2 && newMiddle.length > MAX_PER_SIDE * 2) {
+    const showOld = oldMiddle.slice(0, MAX_PER_SIDE);
+    const showNew = newMiddle.slice(0, MAX_PER_SIDE);
+    const ctxStart = Math.max(0, prefixLen - CTX);
+    const ctxBefore = oldLines.slice(ctxStart, prefixLen);
+    const parts: string[] = [`@@ -${ctxStart + 1},${ctxBefore.length + showOld.length} +${ctxStart + 1},${ctxBefore.length + showNew.length} @@`];
+    for (const l of ctxBefore) parts.push(` ${l}`);
+    for (const l of showOld) parts.push(`-${l}`);
+    parts.push(`-... (${oldMiddle.length - MAX_PER_SIDE} more lines removed)`);
+    for (const l of showNew) parts.push(`+${l}`);
+    parts.push(`+... (${newMiddle.length - MAX_PER_SIDE} more lines added)`);
+    return parts;
+  }
+
+  // Build single hunk with context
+  const ctxStart = Math.max(0, prefixLen - CTX);
+  const ctxBefore = oldLines.slice(ctxStart, prefixLen);
+  const suffixStart = oldLines.length - suffixLen;
+  const newSuffixStart = newLines.length - suffixLen;
+  const ctxAfter = newLines.slice(newSuffixStart, Math.min(newSuffixStart + CTX, newLines.length));
+
+  const hunkOldLen = ctxBefore.length + oldMiddle.length + ctxAfter.length;
+  const hunkNewLen = ctxBefore.length + newMiddle.length + ctxAfter.length;
+
+  const parts: string[] = [`@@ -${ctxStart + 1},${hunkOldLen} +${ctxStart + 1},${hunkNewLen} @@`];
+  for (const l of ctxBefore) parts.push(` ${l}`);
+  for (const l of oldMiddle.slice(0, MAX_PER_SIDE)) parts.push(`-${l}`);
+  if (oldMiddle.length > MAX_PER_SIDE) parts.push(`-... (${oldMiddle.length - MAX_PER_SIDE} more lines removed)`);
+  for (const l of newMiddle.slice(0, MAX_PER_SIDE)) parts.push(`+${l}`);
+  if (newMiddle.length > MAX_PER_SIDE) parts.push(`+... (${newMiddle.length - MAX_PER_SIDE} more lines added)`);
+  for (const l of ctxAfter) parts.push(` ${l}`);
+
+  return parts;
+}
+
 function writeFile(input: Record<string, unknown>): ToolResult {
   const path = resolvePath(input.path as string);
   const content = input.content as string;
   const existed = existsSync(path);
+  const oldContent = existed ? readFileSync(path, "utf-8") : null;
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, content, "utf-8");
+  notifyFileChanged(path);
 
-  // Show content preview (like Claude Code)
-  const lines = content.split("\n");
-  const previewMax = 20;
-  const preview = lines.slice(0, previewMax).map(l => `+ ${l}`);
-  if (lines.length > previewMax) preview.push(`... (+${lines.length - previewMax} more lines)`);
+  const newLines = content.split("\n");
 
+  if (!existed || !oldContent) {
+    // New file — show as all-added unified diff
+    const previewMax = 30;
+    const preview = newLines.slice(0, previewMax).map(l => `+${l}`);
+    if (newLines.length > previewMax) preview.push(`+... (+${newLines.length - previewMax} more lines)`);
+    return {
+      success: true,
+      output: `Created: ${path} (${newLines.length} lines, ${content.length} chars)\n@@ -0,0 +1,${Math.min(newLines.length, previewMax)} @@\n${preview.join("\n")}`,
+    };
+  }
+
+  // Overwrite — compute diff between old and new content
+  const oldLines = oldContent.split("\n");
+  const diff = computeWriteDiff(oldLines, newLines);
+
+  // Count changes
+  let added = 0, removed = 0;
+  for (const line of diff) {
+    if (line.startsWith("+")) added++;
+    else if (line.startsWith("-")) removed++;
+  }
+
+  const summary = `Added ${added} lines, removed ${removed} lines`;
   return {
     success: true,
-    output: `${existed ? "Updated" : "Created"}: ${path} (${lines.length} lines, ${content.length} chars)\n${preview.join("\n")}`,
+    output: `Updated: ${path} (${summary})\n${diff.join("\n")}`,
   };
 }
 
@@ -690,26 +911,46 @@ function editFile(input: Record<string, unknown>): ToolResult {
       if (count > 10000) break; // safety
     }
     writeFileSync(path, content, "utf-8");
+    notifyFileChanged(path);
     return { success: true, output: `File edited: ${path} (${count} replacements)` };
   }
 
   // Single replacement (original behavior)
   const idx = content.indexOf(oldString);
-  content = content.slice(0, idx) + newString + content.slice(idx + oldString.length);
-  writeFileSync(path, content, "utf-8");
+  const newContent = content.slice(0, idx) + newString + content.slice(idx + oldString.length);
+  writeFileSync(path, newContent, "utf-8");
+  notifyFileChanged(path);
 
-  // Compact diff output
+  // Generate unified diff with context and line numbers
+  const allOldLines = content.split("\n");
+  const allNewLines = newContent.split("\n");
+  const beforeEdit = content.slice(0, idx);
+  const startLine = beforeEdit.split("\n").length; // 1-based
   const oldLines = oldString.split("\n");
   const newLines = newString.split("\n");
-  const diffParts: string[] = [];
-  const showMax = 10;
-  for (const l of oldLines.slice(0, showMax)) diffParts.push(`- ${l}`);
-  if (oldLines.length > showMax) diffParts.push(`... (${oldLines.length - showMax} more lines removed)`);
-  for (const l of newLines.slice(0, showMax)) diffParts.push(`+ ${l}`);
-  if (newLines.length > showMax) diffParts.push(`... (${newLines.length - showMax} more lines added)`);
-  const diff = diffParts.length > 0 ? `\n${diffParts.join("\n")}` : "";
 
-  return { success: true, output: `File edited: ${path}${diff}` };
+  const CTX = 3;
+  const MAX_LINES = 20;
+  const ctxStart = Math.max(1, startLine - CTX);
+  const ctxBeforeLines = allOldLines.slice(ctxStart - 1, startLine - 1);
+  const newEndLine = startLine + newLines.length - 1;
+  const ctxAfterLines = allNewLines.slice(newEndLine, Math.min(newEndLine + CTX, allNewLines.length));
+
+  const showOld = oldLines.slice(0, MAX_LINES);
+  const showNew = newLines.slice(0, MAX_LINES);
+  const hunkOldLen = ctxBeforeLines.length + showOld.length + ctxAfterLines.length;
+  const hunkNewLen = ctxBeforeLines.length + showNew.length + ctxAfterLines.length;
+
+  const diffParts: string[] = [];
+  diffParts.push(`@@ -${ctxStart},${hunkOldLen} +${ctxStart},${hunkNewLen} @@`);
+  for (const l of ctxBeforeLines) diffParts.push(` ${l}`);
+  for (const l of showOld) diffParts.push(`-${l}`);
+  if (oldLines.length > MAX_LINES) diffParts.push(`-... (${oldLines.length - MAX_LINES} more lines)`);
+  for (const l of showNew) diffParts.push(`+${l}`);
+  if (newLines.length > MAX_LINES) diffParts.push(`+... (${newLines.length - MAX_LINES} more lines)`);
+  for (const l of ctxAfterLines) diffParts.push(` ${l}`);
+
+  return { success: true, output: `File edited: ${path}\n${diffParts.join("\n")}` };
 }
 
 function multiEdit(input: Record<string, unknown>): ToolResult {
@@ -720,7 +961,9 @@ function multiEdit(input: Record<string, unknown>): ToolResult {
   if (!Array.isArray(edits) || edits.length === 0) return { success: false, output: "edits array is required and must not be empty" };
 
   let content = readFileSync(path, "utf-8");
-  const diffLines: string[] = [];
+  const diffParts: string[] = [];
+  const CTX = 2;
+  const MAX_LINES = 10;
 
   for (let i = 0; i < edits.length; i++) {
     const { old_string, new_string } = edits[i];
@@ -731,22 +974,43 @@ function multiEdit(input: Record<string, unknown>): ToolResult {
         output: `Edit ${i + 1}/${edits.length} failed: old_string not found (${i} edits applied successfully before failure)`,
       };
     }
-    content = content.slice(0, idx) + new_string + content.slice(idx + old_string.length);
 
-    // Build compact diff (first ~3 lines of each side)
-    const oldPreview = old_string.split("\n").slice(0, 3);
-    const newPreview = new_string.split("\n").slice(0, 3);
-    diffLines.push(`  #${i + 1}:`);
-    for (const l of oldPreview) diffLines.push(`    - ${l}`);
-    if (old_string.split("\n").length > 3) diffLines.push(`    ... (${old_string.split("\n").length} lines)`);
-    for (const l of newPreview) diffLines.push(`    + ${l}`);
-    if (new_string.split("\n").length > 3) diffLines.push(`    ... (${new_string.split("\n").length} lines)`);
+    // Compute line numbers before applying edit
+    const allOldLines = content.split("\n");
+    const beforeEdit = content.slice(0, idx);
+    const startLine = beforeEdit.split("\n").length;
+    const oldLines = old_string.split("\n");
+    const newLines = new_string.split("\n");
+
+    const newContent = content.slice(0, idx) + new_string + content.slice(idx + old_string.length);
+    const allNewLines = newContent.split("\n");
+
+    const ctxStart = Math.max(1, startLine - CTX);
+    const ctxBeforeLines = allOldLines.slice(ctxStart - 1, startLine - 1);
+    const newEndLine = startLine + newLines.length - 1;
+    const ctxAfterLines = allNewLines.slice(newEndLine, Math.min(newEndLine + CTX, allNewLines.length));
+
+    const showOld = oldLines.slice(0, MAX_LINES);
+    const showNew = newLines.slice(0, MAX_LINES);
+    const hunkOldLen = ctxBeforeLines.length + showOld.length + ctxAfterLines.length;
+    const hunkNewLen = ctxBeforeLines.length + showNew.length + ctxAfterLines.length;
+
+    diffParts.push(`@@ -${ctxStart},${hunkOldLen} +${ctxStart},${hunkNewLen} @@`);
+    for (const l of ctxBeforeLines) diffParts.push(` ${l}`);
+    for (const l of showOld) diffParts.push(`-${l}`);
+    if (oldLines.length > MAX_LINES) diffParts.push(`-... (${oldLines.length - MAX_LINES} more)`);
+    for (const l of showNew) diffParts.push(`+${l}`);
+    if (newLines.length > MAX_LINES) diffParts.push(`+... (${newLines.length - MAX_LINES} more)`);
+    for (const l of ctxAfterLines) diffParts.push(` ${l}`);
+
+    content = newContent;
   }
 
   writeFileSync(path, content, "utf-8");
+  notifyFileChanged(path);
   return {
     success: true,
-    output: `Applied ${edits.length} edits to ${path}\n${diffLines.join("\n")}`,
+    output: `Applied ${edits.length} edits to ${path}\n${diffParts.join("\n")}`,
   };
 }
 
@@ -1000,6 +1264,7 @@ function grepSearch(input: Record<string, unknown>): ToolResult {
   const caseInsensitive = input.case_insensitive as boolean | undefined;
   const fileType = input.type as string | undefined;
   const headLimit = (input.head_limit as number) || 200;
+  const offset = (input.offset as number) || 0;
   const multiline = input.multiline as boolean | undefined;
 
   // Try ripgrep first
@@ -1024,7 +1289,15 @@ function grepSearch(input: Record<string, unknown>): ToolResult {
       // For count mode, filter zero-count files
       if (outputMode === "count") {
         const lines = result.split("\n").filter((l) => !l.endsWith(":0"));
-        return { success: true, output: lines.join("\n") || "No matches found" };
+        const sliced = offset > 0 ? lines.slice(offset) : lines;
+        return { success: true, output: sliced.join("\n") || "No matches found" };
+      }
+
+      // Apply offset (skip first N entries)
+      if (offset > 0) {
+        const lines = result.split("\n");
+        const sliced = lines.slice(offset);
+        return { success: true, output: sliced.join("\n") || "No matches found" };
       }
 
       return { success: true, output: result };
@@ -1396,6 +1669,8 @@ async function getExaApiKey(): Promise<string | null> {
 async function webSearch(input: Record<string, unknown>): Promise<ToolResult> {
   const query = input.query as string;
   if (!query) return { success: false, output: "query is required" };
+  const allowedDomains = input.allowed_domains as string[] | undefined;
+  const blockedDomains = input.blocked_domains as string[] | undefined;
 
   const apiKey = await getExaApiKey();
   if (!apiKey) {
@@ -1403,6 +1678,15 @@ async function webSearch(input: Record<string, unknown>): Promise<ToolResult> {
   }
 
   try {
+    const searchBody: Record<string, unknown> = {
+      query,
+      numResults: 10,
+      type: "auto",
+      contents: { text: { maxCharacters: 1200, includeHtmlTags: false } },
+    };
+    if (allowedDomains?.length) searchBody.includeDomains = allowedDomains;
+    if (blockedDomains?.length) searchBody.excludeDomains = blockedDomains;
+
     const response = await fetch("https://api.exa.ai/search", {
       method: "POST",
       headers: {
@@ -1410,12 +1694,7 @@ async function webSearch(input: Record<string, unknown>): Promise<ToolResult> {
         "Content-Type": "application/json",
         "Accept": "application/json",
       },
-      body: JSON.stringify({
-        query,
-        numResults: 10,
-        type: "auto",
-        contents: { text: { maxCharacters: 1200, includeHtmlTags: false } },
-      }),
+      body: JSON.stringify(searchBody),
       signal: AbortSignal.timeout(15000),
     });
 
@@ -1449,71 +1728,279 @@ async function webSearch(input: Record<string, unknown>): Promise<ToolResult> {
 
 // --- TODO_WRITE -------------------------------------------------------------
 
-function todoWrite(input: Record<string, unknown>): ToolResult {
-  const todos = input.todos as Array<{ content: string; status: string; activeForm?: string }>;
-  if (!Array.isArray(todos)) return { success: false, output: "todos must be an array" };
+// ============================================================================
+// TASKS TOOL — consolidated CRUD replacing todo_write
+// ============================================================================
 
-  todoState = todos.map((t, i) => ({
-    id: String(i + 1),
-    content: t.content,
-    status: t.status,
-    activeForm: t.activeForm,
-  }));
+function tasksTool(input: Record<string, unknown>): ToolResult {
+  const action = input.action as string;
+  if (!action) return { success: false, output: "action is required (create/update/list/get)" };
 
-  persistTodos();
+  switch (action) {
+    case "create": {
+      const subject = input.subject as string;
+      const description = input.description as string;
+      if (!subject || !description) return { success: false, output: "subject and description required for create" };
 
-  const statusIcon: Record<string, string> = {
-    pending: "[ ]",
-    in_progress: "[~]",
-    completed: "[x]",
-  };
+      taskCounter++;
+      const task: TaskItem = {
+        id: String(taskCounter),
+        subject,
+        description,
+        status: "pending",
+        activeForm: input.activeForm as string | undefined,
+        owner: input.owner as string | undefined,
+        metadata: input.metadata as Record<string, unknown> | undefined,
+        blocks: [],
+        blockedBy: [],
+        createdAt: new Date().toISOString(),
+      };
+      taskState.push(task);
+      persistTasks();
 
-  const summary = todoState
-    .map((t) => `${statusIcon[t.status] || "[ ]"} ${t.content}`)
-    .join("\n");
+      return { success: true, output: `Created task #${task.id}: ${subject}` };
+    }
 
-  const counts = {
-    pending: todoState.filter((t) => t.status === "pending").length,
-    in_progress: todoState.filter((t) => t.status === "in_progress").length,
-    completed: todoState.filter((t) => t.status === "completed").length,
-  };
+    case "update": {
+      const taskId = input.taskId as string;
+      if (!taskId) return { success: false, output: "taskId required for update" };
 
-  return {
-    success: true,
-    output: `Todo list (${todoState.length} items — ${counts.completed} done, ${counts.in_progress} active, ${counts.pending} pending):\n${summary}`,
-  };
+      const task = taskState.find((t) => t.id === taskId);
+      if (!task) return { success: false, output: `Task #${taskId} not found` };
+
+      const newStatus = input.status as string | undefined;
+
+      // Handle deletion
+      if (newStatus === "deleted") {
+        // Remove from other tasks' blocks/blockedBy
+        for (const t of taskState) {
+          t.blocks = t.blocks.filter((id) => id !== taskId);
+          t.blockedBy = t.blockedBy.filter((id) => id !== taskId);
+        }
+        taskState = taskState.filter((t) => t.id !== taskId);
+        persistTasks();
+        return { success: true, output: `Deleted task #${taskId}` };
+      }
+
+      if (newStatus && ["pending", "in_progress", "completed"].includes(newStatus)) {
+        task.status = newStatus as TaskItem["status"];
+      }
+      if (input.subject_update) task.subject = input.subject_update as string;
+      if (input.description !== undefined) task.description = input.description as string;
+      if (input.activeForm !== undefined) task.activeForm = input.activeForm as string;
+      if (input.owner !== undefined) task.owner = input.owner as string;
+      if (input.metadata) {
+        task.metadata = { ...(task.metadata || {}), ...(input.metadata as Record<string, unknown>) };
+        // Remove null keys
+        for (const [k, v] of Object.entries(task.metadata!)) {
+          if (v === null) delete task.metadata![k];
+        }
+      }
+
+      // Dependency management
+      const addBlocks = input.addBlocks as string[] | undefined;
+      const addBlockedBy = input.addBlockedBy as string[] | undefined;
+      if (addBlocks) {
+        for (const id of addBlocks) {
+          if (!task.blocks.includes(id)) task.blocks.push(id);
+          const target = taskState.find((t) => t.id === id);
+          if (target && !target.blockedBy.includes(taskId)) target.blockedBy.push(taskId);
+        }
+      }
+      if (addBlockedBy) {
+        for (const id of addBlockedBy) {
+          if (!task.blockedBy.includes(id)) task.blockedBy.push(id);
+          const target = taskState.find((t) => t.id === id);
+          if (target && !target.blocks.includes(taskId)) target.blocks.push(taskId);
+        }
+      }
+
+      persistTasks();
+      return { success: true, output: `Updated task #${taskId}: ${task.subject} [${task.status}]` };
+    }
+
+    case "list": {
+      if (taskState.length === 0) return { success: true, output: "No tasks." };
+
+      const icon: Record<string, string> = { pending: "[ ]", in_progress: "[~]", completed: "[x]" };
+      const lines = taskState.map((t) => {
+        let line = `#${t.id}. ${icon[t.status] || "[ ]"} ${t.subject}`;
+        if (t.owner) line += ` (${t.owner})`;
+        // Show only open blockers
+        const openBlockers = t.blockedBy.filter((id) => {
+          const blocker = taskState.find((b) => b.id === id);
+          return blocker && blocker.status !== "completed";
+        });
+        if (openBlockers.length > 0) line += ` ← blocked by #${openBlockers.join(", #")}`;
+        return line;
+      });
+
+      const counts = {
+        pending: taskState.filter((t) => t.status === "pending").length,
+        in_progress: taskState.filter((t) => t.status === "in_progress").length,
+        completed: taskState.filter((t) => t.status === "completed").length,
+      };
+
+      return {
+        success: true,
+        output: `Tasks (${taskState.length}: ${counts.completed} done, ${counts.in_progress} active, ${counts.pending} pending):\n${lines.join("\n")}`,
+      };
+    }
+
+    case "get": {
+      const taskId = input.taskId as string;
+      if (!taskId) return { success: false, output: "taskId required for get" };
+
+      const task = taskState.find((t) => t.id === taskId);
+      if (!task) return { success: false, output: `Task #${taskId} not found` };
+
+      const details = [
+        `# Task #${task.id}: ${task.subject}`,
+        `Status: ${task.status}`,
+        task.owner ? `Owner: ${task.owner}` : null,
+        task.activeForm ? `Active form: ${task.activeForm}` : null,
+        `Created: ${task.createdAt}`,
+        task.blocks.length ? `Blocks: #${task.blocks.join(", #")}` : null,
+        task.blockedBy.length ? `Blocked by: #${task.blockedBy.join(", #")}` : null,
+        task.metadata ? `Metadata: ${JSON.stringify(task.metadata)}` : null,
+        "",
+        task.description,
+      ].filter(Boolean).join("\n");
+
+      return { success: true, output: details };
+    }
+
+    default:
+      return { success: false, output: `Unknown action: ${action}. Use create/update/list/get.` };
+  }
 }
 
-/** Persist todos to disk (fire-and-forget) */
-function persistTodos(): void {
+/** Persist tasks to disk (fire-and-forget) */
+function persistTasks(): void {
   if (!todoSessionId) return;
   try {
     if (!existsSync(TODOS_DIR)) mkdirSync(TODOS_DIR, { recursive: true });
-    writeFileSync(join(TODOS_DIR, `${todoSessionId}.json`), JSON.stringify(todoState, null, 2), "utf-8");
+    writeFileSync(
+      join(TODOS_DIR, `${todoSessionId}.json`),
+      JSON.stringify({ tasks: taskState, counter: taskCounter }, null, 2),
+      "utf-8"
+    );
   } catch { /* best effort */ }
 }
 
-/** Load todos from disk for a session */
+/** Load tasks from disk for a session */
 export function loadTodos(sessionId: string): void {
   const path = join(TODOS_DIR, `${sessionId}.json`);
   if (!existsSync(path)) return;
   try {
-    const data = JSON.parse(readFileSync(path, "utf-8"));
-    if (Array.isArray(data)) {
-      todoState = data;
-      todoSessionId = sessionId;
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    // Support both old format (array) and new format ({tasks, counter})
+    if (Array.isArray(raw)) {
+      // Migrate old todo format
+      taskState = raw.map((t: any, i: number) => ({
+        id: t.id || String(i + 1),
+        subject: t.content || t.subject || "Untitled",
+        description: t.content || t.description || "",
+        status: t.status || "pending",
+        activeForm: t.activeForm,
+        blocks: t.blocks || [],
+        blockedBy: t.blockedBy || [],
+        createdAt: t.createdAt || new Date().toISOString(),
+      }));
+      taskCounter = taskState.length;
+    } else if (raw.tasks) {
+      taskState = raw.tasks;
+      taskCounter = raw.counter || taskState.length;
     }
+    todoSessionId = sessionId;
   } catch { /* skip corrupted */ }
 }
 
-/** Link todos to a session for persistence */
+/** Link tasks to a session for persistence */
 export function setTodoSessionId(id: string): void {
   todoSessionId = id;
 }
 
-/** Get current todo state (for UI display) */
-export function getTodoState(): typeof todoState {
-  return todoState;
+/** Get current task state (for UI display) */
+export function getTodoState(): typeof taskState {
+  return taskState;
+}
+
+// ============================================================================
+// CONFIG TOOL — runtime settings + plan mode (consolidated)
+// ============================================================================
+
+async function configTool(input: Record<string, unknown>): Promise<ToolResult> {
+  const setting = input.setting as string;
+  const value = input.value as string | undefined;
+  const agentLoop = await getAgentLoop();
+
+  switch (setting) {
+    case "model": {
+      if (!value) return { success: true, output: `Current model: ${agentLoop.getModel()}` };
+      const result = agentLoop.setModel(value);
+      return { success: result.success, output: `Model set to: ${result.model}` };
+    }
+
+    case "mode":
+    case "permission_mode": {
+      if (!value) return { success: true, output: `Current mode: ${agentLoop.getPermissionMode()}` };
+      if (!["default", "plan", "yolo"].includes(value)) {
+        return { success: false, output: `Invalid mode: ${value}. Use: default, plan, yolo` };
+      }
+      const result = agentLoop.setPermissionMode(value as "default" | "plan" | "yolo");
+      return { success: result.success, output: result.message };
+    }
+
+    case "memory": {
+      if (!value) {
+        const memPath = join(homedir(), ".swagmanager", "memory", "MEMORY.md");
+        if (!existsSync(memPath)) return { success: true, output: "No memory file found." };
+        const content = readFileSync(memPath, "utf-8");
+        return { success: true, output: `Memory (${content.length} chars):\n${content.slice(0, 2000)}` };
+      }
+      return { success: false, output: "Use read_file/write_file to edit memory directly." };
+    }
+
+    default:
+      return { success: false, output: `Unknown setting: ${setting}. Available: model, mode, memory` };
+  }
+}
+
+// ============================================================================
+// ASK_USER TOOL — structured questions via event emitter
+// ============================================================================
+
+function askUser(input: Record<string, unknown>): ToolResult {
+  const question = input.question as string;
+  const options = input.options as Array<{ label: string; description: string }>;
+
+  if (!question) return { success: false, output: "question is required" };
+  if (!options || options.length < 2) return { success: false, output: "at least 2 options required" };
+
+  // Emit the question via the global event emitter for the UI to render
+  const emitter = getGlobalEmitter();
+  if (emitter) {
+    emitter.emit("ask_user", { question, options });
+  }
+
+  // Format question as text for the model to see in the response
+  // The actual interactive selection happens in the UI layer
+  const optionLines = options.map((o, i) => `  ${i + 1}. **${o.label}** — ${o.description}`).join("\n");
+  return {
+    success: true,
+    output: `Question presented to user:\n${question}\n\nOptions:\n${optionLines}\n\n(Waiting for user response...)`,
+  };
+}
+
+// ============================================================================
+// LSP TOOL — code intelligence
+// ============================================================================
+
+async function lspTool(input: Record<string, unknown>): Promise<ToolResult> {
+  const operation = input.operation as string;
+  if (!operation) return { success: false, output: "operation is required" };
+  return await executeLSP(operation, input);
 }
 
 // ============================================================================

@@ -469,7 +469,7 @@ let activePermissionMode: PermissionMode = "default";
 const PLAN_MODE_TOOLS = new Set([
   "read_file", "list_directory", "search_files", "search_content",
   "glob", "grep", "web_fetch", "web_search", "task", "task_output",
-  "bash_output", "list_shells", "todo_write",
+  "bash_output", "list_shells", "tasks", "config", "ask_user",
 ]);
 
 export function setPermissionMode(mode: PermissionMode): { success: boolean; message: string } {

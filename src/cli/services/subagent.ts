@@ -303,7 +303,7 @@ function getToolsForAgent(type: SubagentType | string): string[] {
       return [
         "read_file", "write_file", "edit_file", "list_directory",
         "search_files", "search_content", "run_command",
-        "glob", "grep", "notebook_edit", "web_fetch", "todo_write",
+        "glob", "grep", "notebook_edit", "web_fetch", "tasks",
       ];
     default:
       return ["read_file", "glob", "grep"];
@@ -860,6 +860,35 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
     state.updatedAt = new Date().toISOString();
     saveAgentState(state);
 
+    // Log the subagent's final response as a chat.assistant_response span
+    // This ensures the full output is visible in the telemetry waterfall
+    if (finalText) {
+      logSpan({
+        action: "chat.assistant_response",
+        durationMs: Date.now() - startTime,
+        context: {
+          ...turnCtx,
+          spanId: generateSpanId(),
+          parentSpanId: turnCtx.spanId,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+        },
+        details: {
+          response: finalText,
+          agent_id: agentId,
+          agent_name: name || `subagent-${subagent_type}`,
+          agent_type: subagent_type,
+          is_subagent: true,
+          model: modelId,
+          input_tokens: totalIn,
+          output_tokens: totalOut,
+          turn_count: Math.floor(state.messages.length / 2),
+          tool_calls: state.toolsUsed.length,
+          tool_names: state.toolsUsed,
+        },
+      });
+    }
+
     // Log telemetry with rich metadata for trace visualization
     logSpan({
       action: `subagent.${subagent_type}`,
@@ -890,9 +919,9 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
         display_icon: getAgentIcon(subagent_type),
         display_color: getAgentColor(subagent_type),
 
-        // Summary for trace feed
-        summary: finalText.slice(0, 200) + (finalText.length > 200 ? "..." : ""),
-        prompt_preview: prompt.slice(0, 100) + (prompt.length > 100 ? "..." : ""),
+        // Summary for trace feed (2000 chars for meaningful preview)
+        summary: finalText.slice(0, 2000) + (finalText.length > 2000 ? "..." : ""),
+        prompt_preview: prompt.slice(0, 200) + (prompt.length > 200 ? "..." : ""),
       },
     });
 
