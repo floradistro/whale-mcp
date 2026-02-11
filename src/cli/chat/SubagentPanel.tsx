@@ -115,15 +115,15 @@ function RunningAgentTree({ agent, isLast, isOnly }: {
     <Box flexDirection="column">
       {/* Agent header */}
       <Text>
-        {!isOnly ? <Text color="#48484A">{isLast ? "└── " : "├── "}</Text> : null}
+        {!isOnly ? <Text dimColor>{isLast ? "└── " : "├── "}</Text> : null}
         <Text color="#0A84FF"><Spinner type="dots" /></Text>
         <Text color="#E5E5EA" bold> {label}</Text>
-        {desc ? <Text color="#8E8E93"> {desc}</Text> : null}
-        {agent.turn > 0 ? <Text color="#48484A"> · Turn {agent.turn}</Text> : null}
+        {desc ? <Text dimColor> {desc}</Text> : null}
+        {agent.turn > 0 ? <Text dimColor> · Turn {agent.turn}</Text> : null}
       </Text>
 
       {hiddenCount > 0 && (
-        <Text color="#48484A">{childPrefix}│   ... +{hiddenCount} earlier</Text>
+        <Text dimColor>{childPrefix}│   ... +{hiddenCount} earlier</Text>
       )}
 
       {visibleTools.map((tool, i) => {
@@ -133,7 +133,7 @@ function RunningAgentTree({ agent, isLast, isOnly }: {
 
         return (
           <Text key={`${tool.name}-${i}`}>
-            <Text color="#48484A">{childPrefix}{toolBranch}</Text>
+            <Text dimColor>{childPrefix}{toolBranch}</Text>
             {tool.status === "running" ? (
               <Text color="#0A84FF"><Spinner type="dots" /></Text>
             ) : tool.status === "success" ? (
@@ -142,16 +142,16 @@ function RunningAgentTree({ agent, isLast, isOnly }: {
               <Text color="#FF453A">✕</Text>
             )}
             <Text bold> {getDisplayName(tool.name)}</Text>
-            {ctx ? <Text color="#8E8E93">  {ctx}</Text> : null}
+            {ctx ? <Text dimColor>  {ctx}</Text> : null}
           </Text>
         );
       })}
 
       {isThinking && (
         <Text>
-          <Text color="#48484A">{childPrefix}└── </Text>
+          <Text dimColor>{childPrefix}└── </Text>
           <Text color="#0A84FF"><Spinner type="dots" /></Text>
-          <Text color="#8E8E93"> thinking...</Text>
+          <Text dimColor> thinking...</Text>
         </Text>
       )}
     </Box>
@@ -191,12 +191,12 @@ export function CompletedSubagentTree({ agents }: { agents: CompletedSubagentInf
         return (
           <React.Fragment key={agent.id}>
             <Text>
-              <Text color="#48484A">{branch}</Text>
+              <Text dimColor>{branch}</Text>
               <Text color="#E5E5EA">{label} {agent.description}</Text>
-              <Text color="#48484A"> · {agent.toolCount} tool use{agent.toolCount !== 1 ? "s" : ""} · {formatTokens(totalTokens)} tokens</Text>
+              <Text dimColor> · {agent.toolCount} tool use{agent.toolCount !== 1 ? "s" : ""} · {formatTokens(totalTokens)} tokens</Text>
             </Text>
             <Text>
-              <Text color="#48484A">{childPrefix}</Text>
+              <Text dimColor>{childPrefix}</Text>
               {agent.success ? (
                 <Text color="#30D158">Done</Text>
               ) : (

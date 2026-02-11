@@ -27,6 +27,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/mcp",      description: "Server connection status" },
   { name: "/store",    description: "Switch active store" },
   { name: "/status",   description: "Show session info" },
+  { name: "/agents",   description: "List available agent types" },
   { name: "/update",   description: "Check for updates & install" },
   { name: "/clear",    description: "Clear conversation" },
   { name: "/exit",     description: "Exit" },
@@ -131,7 +132,7 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
       <Text>{" "}</Text>
       <Text color={colors.separator}>{divider}</Text>
       <Box>
-        <Text color="#E5E5EA" bold>{">"} </Text>
+        <Text color="#E5E5EA" bold>{"❯"} </Text>
         <TextInput
           value={value}
           onChange={handleChange}

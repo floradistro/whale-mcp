@@ -12,6 +12,7 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+import { readFileSync, existsSync } from "fs";
 
 // ============================================================================
 // TYPES
@@ -311,6 +312,57 @@ export function listProcesses(): Array<{
       errorLines: p.errorBuffer.length,
     };
   });
+}
+
+// ============================================================================
+// BACKGROUND AGENT TRACKING
+// ============================================================================
+
+interface BackgroundAgent {
+  id: string;
+  type: string;
+  outputFile: string;
+  startTime: number;
+  status: "running" | "completed" | "failed";
+}
+
+const bgAgents = new Map<string, BackgroundAgent>();
+
+export function registerBackgroundAgent(id: string, type: string, outputFile: string): void {
+  bgAgents.set(id, { id, type, outputFile, startTime: Date.now(), status: "running" });
+}
+
+export function getAgentStatus(id: string): BackgroundAgent | null {
+  return bgAgents.get(id) || null;
+}
+
+export function markAgentDone(id: string, success: boolean): void {
+  const agent = bgAgents.get(id);
+  if (agent) agent.status = success ? "completed" : "failed";
+}
+
+export function readAgentOutput(id: string): { status: string; output: string } | null {
+  const agent = bgAgents.get(id);
+  if (!agent) return null;
+  try {
+    const content = existsSync(agent.outputFile) ? readFileSync(agent.outputFile, "utf-8") : "(no output yet)";
+    return { status: agent.status, output: content };
+  } catch {
+    return { status: agent.status, output: "(failed to read output file)" };
+  }
+}
+
+export function listBackgroundAgents(): BackgroundAgent[] {
+  return Array.from(bgAgents.values());
+}
+
+export function stopBackgroundAgent(id: string): { success: boolean; message: string } {
+  const agent = bgAgents.get(id);
+  if (!agent) return { success: false, message: `Agent not found: ${id}` };
+  if (agent.status !== "running") return { success: false, message: `Agent already ${agent.status}` };
+  // We can't kill the async promise, but we mark it as failed so it won't be waited on
+  agent.status = "failed";
+  return { success: true, message: `Agent ${id} marked as stopped` };
 }
 
 // ============================================================================

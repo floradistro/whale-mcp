@@ -241,6 +241,11 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     description: "List background tasks/shells",
     handler: () => ({ handled: true, action: "list_tasks" }),
   },
+  {
+    name: "agents",
+    description: "List available agent types",
+    handler: () => ({ handled: true, action: "list_agents" }),
+  },
 ];
 
 export function getBuiltInCommand(name: string): BuiltInCommand | undefined {

@@ -358,7 +358,8 @@ ${process.cwd()}
 ## Tool Use
 - Call multiple independent tools in ONE response (parallel execution)
 - Only chain across turns when a result is needed for the next call
-- If a tool fails 3 times, try a different approach`;
+- If a tool fails 3 times, try a different approach
+- Use task with run_in_background:true for long tasks; check with task_output, stop with task_stop`;
 
   if (hasServerTools) {
     prompt += `\n- Use audit_trail for store activity, telemetry for AI system metrics`;
@@ -409,9 +410,13 @@ async function getTools(): Promise<{ tools: Anthropic.Tool[]; serverToolCount: n
     // Server tools silently unavailable
   }
 
+  // Deduplicate: local tools take priority over server tools with the same name
+  const localNames = new Set(localTools.map(t => t.name));
+  const uniqueServerTools = serverTools.filter(t => !localNames.has(t.name));
+
   return {
-    tools: [...localTools, ...serverTools],
-    serverToolCount: serverTools.length,
+    tools: [...localTools, ...uniqueServerTools],
+    serverToolCount: uniqueServerTools.length,
   };
 }
 
@@ -1122,7 +1127,7 @@ export {
 } from "./interactive-tools.js";
 
 // Re-export background process listing for /tasks command
-export { listProcesses } from "./background-processes.js";
+export { listProcesses, listBackgroundAgents } from "./background-processes.js";
 
 // Re-export event emitter for ChatApp
 export { AgentEventEmitter, type AgentEvent } from "./agent-events.js";

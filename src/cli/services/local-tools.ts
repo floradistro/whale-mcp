@@ -20,6 +20,7 @@ import { execSync, spawn } from "child_process";
 import { homedir } from "os";
 import {
   runSubagent,
+  runSubagentBackground,
   type SubagentType,
   type ParentTraceContext,
 } from "./subagent.js";
@@ -33,8 +34,10 @@ import {
   type TeamConfig,
 } from "./team-lead.js";
 import { isRgAvailable, rgGrep, rgGlob } from "./ripgrep.js";
-import { spawnBackground, readProcessOutput, killProcess, listProcesses } from "./background-processes.js";
+import { spawnBackground, readProcessOutput, killProcess, listProcesses, readAgentOutput, stopBackgroundAgent, listBackgroundAgents } from "./background-processes.js";
 import { getGlobalEmitter } from "./agent-events.js";
+import { getValidToken, SUPABASE_URL, createAuthenticatedClient } from "./auth-service.js";
+import { resolveConfig } from "./config-store.js";
 
 // ============================================================================
 // TYPES
@@ -89,6 +92,11 @@ export const LOCAL_TOOL_NAMES = new Set([
   "bash_output",
   "kill_shell",
   "list_shells",
+  // Background task tools (shells + agents)
+  "task_output",
+  "task_stop",
+  // Web search
+  "web_search",
 ]);
 
 export function isLocalTool(name: string): boolean {
@@ -182,7 +190,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   },
   {
     name: "run_command",
-    description: "Execute a shell command. Output streams live. Use run_in_background:true for dev servers/watchers — after starting, use bash_output to verify the server is running.",
+    description: "Execute a shell command. Output streams live. Use run_in_background:true for dev servers/watchers — after starting, use bash_output to verify. On macOS use python3 not python.",
     input_schema: {
       type: "object",
       properties: {
@@ -277,6 +285,21 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   },
 
   // ------------------------------------------------------------------
+  // NEW: WEB_SEARCH — search the web via Exa API
+  // ------------------------------------------------------------------
+  {
+    name: "web_search",
+    description: "Search the web for current information. Returns titles, URLs, and snippets.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+      },
+      required: ["query"],
+    },
+  },
+
+  // ------------------------------------------------------------------
   // NEW: TODO_WRITE — session task tracking
   // ------------------------------------------------------------------
   {
@@ -333,7 +356,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   // ------------------------------------------------------------------
   {
     name: "task",
-    description: "Launch a subagent that runs in isolated context and returns a summary when done. Use for discrete tasks completable in 2-6 turns.",
+    description: "Launch a subagent that runs in isolated context and returns a summary when done. Use for discrete tasks completable in 2-6 turns. Use run_in_background for long tasks.",
     input_schema: {
       type: "object",
       properties: {
@@ -347,6 +370,22 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
           type: "string",
           enum: ["sonnet", "opus", "haiku"],
           description: "Haiku for quick tasks, Sonnet (default) for most, Opus for complex",
+        },
+        run_in_background: {
+          type: "boolean",
+          description: "Run agent in background. Returns output_file path to check progress via task_output.",
+        },
+        max_turns: {
+          type: "number",
+          description: "Max agentic turns (1-50). Default 8.",
+        },
+        name: {
+          type: "string",
+          description: "Display name for the agent.",
+        },
+        description: {
+          type: "string",
+          description: "Short 3-5 word description of the task.",
         },
       },
       required: ["prompt", "subagent_type"],
@@ -438,6 +477,33 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
       required: [],
     },
   },
+  // ------------------------------------------------------------------
+  // TASK OUTPUT / TASK STOP — unified background task management
+  // ------------------------------------------------------------------
+  {
+    name: "task_output",
+    description: "Get output from a background task (shell or agent). Returns status and output content.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "The task/agent ID (e.g. shell-xxx or agent-xxx)" },
+        block: { type: "boolean", description: "Wait for completion (default: true)" },
+        timeout: { type: "number", description: "Max wait time in ms (default: 30000)" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "task_stop",
+    description: "Stop a running background task (shell or agent) by ID.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "The task ID to stop" },
+      },
+      required: ["task_id"],
+    },
+  },
 ];
 
 // ============================================================================
@@ -476,10 +542,13 @@ export async function executeLocalTool(
       case "grep":            return grepSearch(input);
       case "notebook_edit":   return notebookEdit(input);
       case "web_fetch":       return await webFetch(input);
+      case "web_search":      return await webSearch(input);
       case "todo_write":      return todoWrite(input);
       case "multi_edit":      return multiEdit(input);
       case "task":            return await taskTool(input);
       case "team_create":     return await teamCreateTool(input);
+      case "task_output":     return await taskOutput(input);
+      case "task_stop":       return taskStop(input);
       default:                return { success: false, output: `Unknown local tool: ${name}` };
     }
   } catch (err) {
@@ -1150,66 +1219,28 @@ async function webFetch(input: Record<string, unknown>): Promise<ToolResult> {
   }
 }
 
-/** Enhanced HTML → readable text/markdown converter */
-function htmlToText(html: string): string {
-  return html
-    // Remove scripts, styles, head, nav, footer, aside, HTML comments
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
-    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, "")
-    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, "")
-    .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    // Convert headings to markdown
-    .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, level, content) =>
-      "\n" + "#".repeat(parseInt(level)) + " " + stripTags(content).trim() + "\n\n"
-    )
-    // Convert links to markdown
-    .replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, text) =>
-      `[${stripTags(text).trim()}](${href})`
-    )
-    // Convert tables to pipe-delimited
-    .replace(/<table[^>]*>([\s\S]*?)<\/table>/gi, (_, tableContent) => {
-      const rows: string[] = [];
-      const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-      let rowMatch;
-      let isFirstRow = true;
-      while ((rowMatch = rowRegex.exec(tableContent)) !== null) {
-        const cells: string[] = [];
-        const cellRegex = /<(?:td|th)[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
-        let cellMatch;
-        while ((cellMatch = cellRegex.exec(rowMatch[1])) !== null) {
-          cells.push(stripTags(cellMatch[1]).trim());
-        }
-        if (cells.length > 0) {
-          rows.push("| " + cells.join(" | ") + " |");
-          if (isFirstRow) {
-            rows.push("| " + cells.map(() => "---").join(" | ") + " |");
-            isFirstRow = false;
-          }
-        }
-      }
-      return "\n" + rows.join("\n") + "\n";
-    })
-    // Convert list items
-    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, content) => "- " + stripTags(content).trim() + "\n")
-    // Convert paragraphs, divs, br
-    .replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_, content) => stripTags(content).trim() + "\n\n")
-    .replace(/<div[^>]*>([\s\S]*?)<\/div>/gi, (_, content) => stripTags(content).trim() + "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    // Images → alt text
-    .replace(/<img[^>]*alt="([^"]*)"[^>]*>/gi, (_, alt) => `[${alt}]`)
-    .replace(/<img[^>]*>/gi, "")
-    // Bold, italic
-    .replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**")
-    .replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*")
-    // Code
-    .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`")
-    .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, "\n```\n$1\n```\n")
-    // Strip remaining tags
-    .replace(/<[^>]+>/g, "")
-    // Decode entities (including hex)
+/** Remove all instances of a tag and its content, handling nesting (innermost first) */
+function removeNestedTag(html: string, tag: string): string {
+  const pattern = new RegExp(
+    `<${tag}[^>]*>(?:(?!<${tag}[\\s>/])[\\s\\S])*?<\\/${tag}>`, "gi"
+  );
+  let result = html;
+  let prev = "";
+  let safety = 0;
+  while (result !== prev && safety++ < 50) {
+    prev = result;
+    result = result.replace(pattern, "");
+  }
+  result = result.replace(new RegExp(`<${tag}[^>]*>`, "gi"), "");
+  return result;
+}
+
+function stripTags(html: string): string {
+  return html.replace(/<[^>]+>/g, "");
+}
+
+function decodeEntities(text: string): string {
+  return text
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -1218,15 +1249,202 @@ function htmlToText(html: string): string {
     .replace(/&#39;/g, "'")
     .replace(/&#x27;/g, "'")
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)))
-    // Clean up whitespace
-    .replace(/ {2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)));
 }
 
-function stripTags(html: string): string {
-  return html.replace(/<[^>]+>/g, "");
+/** Enhanced HTML → readable text/markdown converter */
+function htmlToText(html: string): string {
+  let c = html;
+
+  // 1. Extract main content area (skips nav, sidebar, footer automatically)
+  const mainMatch = c.match(/<main[^>]*>([\s\S]*)<\/main>/i)
+    || c.match(/<article[^>]*>([\s\S]*)<\/article>/i);
+  if (mainMatch) {
+    c = mainMatch[1];
+  } else {
+    const bodyMatch = c.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+    if (bodyMatch) c = bodyMatch[1];
+  }
+
+  // 2. Remove non-content elements (nesting-aware)
+  for (const tag of [
+    "script", "style", "nav", "footer", "aside", "header",
+    "form", "svg", "iframe", "select", "button", "noscript",
+  ]) {
+    c = removeNestedTag(c, tag);
+  }
+
+  // 3. Remove HTML comments
+  c = c.replace(/<!--[\s\S]*?-->/g, "");
+
+  // 4. Convert semantic elements → markdown
+
+  // Code blocks first (preserve contents)
+  c = c.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, inner) =>
+    "\n```\n" + stripTags(inner).trim() + "\n```\n"
+  );
+  c = c.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+
+  // Headings
+  c = c.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, level, text) =>
+    "\n" + "#".repeat(parseInt(level)) + " " + stripTags(text).trim() + "\n\n"
+  );
+
+  // Links — skip empty, anchor-only, and javascript: hrefs
+  c = c.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, text) => {
+    const linkText = stripTags(text).trim();
+    if (!linkText) return "";
+    if (href.startsWith("#") || href.startsWith("javascript:")) return linkText;
+    return `[${linkText}](${href})`;
+  });
+
+  // Tables → pipe-delimited markdown
+  c = c.replace(/<table[^>]*>([\s\S]*?)<\/table>/gi, (_, tableContent) => {
+    const rows: string[] = [];
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let rowMatch;
+    let isFirstRow = true;
+    while ((rowMatch = rowRegex.exec(tableContent)) !== null) {
+      const cells: string[] = [];
+      const cellRegex = /<(?:td|th)[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
+      let cellMatch;
+      while ((cellMatch = cellRegex.exec(rowMatch[1])) !== null) {
+        cells.push(stripTags(cellMatch[1]).trim());
+      }
+      if (cells.length > 0) {
+        rows.push("| " + cells.join(" | ") + " |");
+        if (isFirstRow) {
+          rows.push("| " + cells.map(() => "---").join(" | ") + " |");
+          isFirstRow = false;
+        }
+      }
+    }
+    return "\n" + rows.join("\n") + "\n";
+  });
+
+  // List items
+  c = c.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, text) =>
+    "- " + stripTags(text).trim() + "\n"
+  );
+
+  // Bold, italic
+  c = c.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**");
+  c = c.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*");
+
+  // Images → alt text
+  c = c.replace(/<img[^>]*alt="([^"]*)"[^>]*>/gi, "[$1]");
+  c = c.replace(/<img[^>]*>/gi, "");
+
+  // Horizontal rules
+  c = c.replace(/<hr\s*\/?>/gi, "\n---\n");
+
+  // 5. Block elements → newlines (replace tags independently, NOT as pairs)
+  c = c.replace(/<\/(?:p|div|section|article|main|blockquote|dd|dt|figcaption|figure|details|summary)>/gi, "\n\n");
+  c = c.replace(/<(?:p|div|section|article|main|blockquote|dd|dt|figcaption|figure|details|summary)[^>]*>/gi, "");
+  c = c.replace(/<br\s*\/?>/gi, "\n");
+  c = c.replace(/<\/(?:li|tr|thead|tbody|tfoot|ul|ol|dl)>/gi, "\n");
+
+  // 6. Strip all remaining tags
+  c = c.replace(/<[^>]+>/g, "");
+
+  // 7. Decode HTML entities
+  c = decodeEntities(c);
+
+  // 8. Clean whitespace
+  c = c
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return c;
+}
+
+// --- WEB_SEARCH -------------------------------------------------------------
+
+// Cache the Exa API key within a session
+let cachedExaKey: string | null = null;
+
+async function getExaApiKey(): Promise<string | null> {
+  if (cachedExaKey) return cachedExaKey;
+
+  try {
+    const config = resolveConfig();
+
+    // Tier 1: Service role key (MCP server mode)
+    if (config.supabaseUrl && config.supabaseKey) {
+      const { createClient } = await import("@supabase/supabase-js");
+      const client = createClient(config.supabaseUrl, config.supabaseKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      const { data } = await client.from("platform_secrets").select("value").eq("key", "exa_api_key").single();
+      if (data?.value) { cachedExaKey = data.value; return cachedExaKey; }
+    }
+
+    // Tier 2: User JWT
+    const token = await getValidToken();
+    if (token) {
+      const client = createAuthenticatedClient(token);
+      const { data } = await client.from("platform_secrets").select("value").eq("key", "exa_api_key").single();
+      if (data?.value) { cachedExaKey = data.value; return cachedExaKey; }
+    }
+  } catch { /* swallow */ }
+
+  return null;
+}
+
+async function webSearch(input: Record<string, unknown>): Promise<ToolResult> {
+  const query = input.query as string;
+  if (!query) return { success: false, output: "query is required" };
+
+  const apiKey = await getExaApiKey();
+  if (!apiKey) {
+    return { success: false, output: "Exa API key not configured. Add 'exa_api_key' to platform_secrets table." };
+  }
+
+  try {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        numResults: 10,
+        type: "auto",
+        contents: { text: { maxCharacters: 1200, includeHtmlTags: false } },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      return { success: false, output: `Exa API error (${response.status}): ${errBody}` };
+    }
+
+    const data = await response.json();
+    const results = (data.results || []).map((r: any, i: number) => {
+      const parts = [
+        `${i + 1}. **${r.title || "Untitled"}**`,
+        `   ${r.url}`,
+      ];
+      if (r.publishedDate) parts.push(`   Published: ${r.publishedDate}`);
+      if (r.text) parts.push(`   ${r.text.slice(0, 500)}`);
+      return parts.join("\n");
+    });
+
+    return {
+      success: true,
+      output: `Found ${results.length} results for "${query}":\n\n${results.join("\n\n")}`,
+    };
+  } catch (err: any) {
+    if (err.name === "TimeoutError" || err.message?.includes("timeout")) {
+      return { success: false, output: "Exa search timed out (15s)" };
+    }
+    return { success: false, output: `Web search error: ${err.message || err}` };
+  }
 }
 
 // --- TODO_WRITE -------------------------------------------------------------
@@ -1319,15 +1537,39 @@ async function taskTool(input: Record<string, unknown>): Promise<ToolResult> {
   const prompt = input.prompt as string;
   const subagent_type = input.subagent_type as SubagentType;
   const model = (input.model as "sonnet" | "opus" | "haiku") || "haiku";
+  const runInBackground = input.run_in_background as boolean | undefined;
+  const maxTurns = input.max_turns as number | undefined;
+  const agentName = input.name as string | undefined;
 
   if (!prompt) return { success: false, output: "prompt is required" };
   if (!subagent_type) return { success: false, output: "subagent_type is required" };
 
   try {
+    // Background mode: start agent, return output file path immediately
+    if (runInBackground) {
+      const { agentId, outputFile } = await runSubagentBackground({
+        prompt,
+        subagent_type,
+        model,
+        max_turns: maxTurns,
+        name: agentName,
+        run_in_background: true,
+        parentTraceContext: getParentTraceContext(),
+      });
+
+      return {
+        success: true,
+        output: `Background agent started.\n  agent_id: ${agentId}\n  output_file: ${outputFile}\n\nUse task_output with task_id="${agentId}" to check progress.`,
+      };
+    }
+
+    // Foreground mode: run agent synchronously
     const result = await runSubagent({
       prompt,
       subagent_type,
       model,
+      max_turns: maxTurns,
+      name: agentName,
       parentTraceContext: getParentTraceContext(),
     });
 
@@ -1341,6 +1583,68 @@ async function taskTool(input: Record<string, unknown>): Promise<ToolResult> {
       output: `Task failed: ${err.message || err}`,
     };
   }
+}
+
+// ============================================================================
+// TASK OUTPUT / TASK STOP — unified background task management
+// ============================================================================
+
+async function taskOutput(input: Record<string, unknown>): Promise<ToolResult> {
+  const taskId = input.task_id as string;
+  const block = (input.block as boolean) ?? true;
+  const timeout = Math.min((input.timeout as number) || 30000, 120000);
+
+  if (!taskId) return { success: false, output: "task_id is required" };
+
+  // Check if it's a background agent (agent-xxx prefix)
+  if (taskId.startsWith("agent-")) {
+    const agentResult = readAgentOutput(taskId);
+    if (!agentResult) return { success: false, output: `Agent not found: ${taskId}. Use list_shells to see available tasks.` };
+
+    // If blocking and still running, poll until done or timeout
+    if (block && agentResult.status === "running") {
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        await new Promise(r => setTimeout(r, 1000));
+        const updated = readAgentOutput(taskId);
+        if (updated && updated.status !== "running") {
+          return { success: true, output: `[${updated.status}]\n${updated.output}` };
+        }
+      }
+      const final = readAgentOutput(taskId);
+      return { success: true, output: `[${final?.status || "running"} — timed out waiting]\n${final?.output || ""}` };
+    }
+
+    return { success: true, output: `[${agentResult.status}]\n${agentResult.output}` };
+  }
+
+  // Fall back to shell process output (bash_output behavior)
+  const result = readProcessOutput(taskId, {});
+  if ("error" in result) return { success: false, output: result.error };
+
+  const statusIcon = result.status === "running" ? "●" : result.status === "completed" ? "✓" : "✕";
+  const lines: string[] = [];
+  lines.push(`${statusIcon} Task ${taskId} — ${result.status}`);
+  if (result.exitCode !== undefined) lines.push(`  Exit code: ${result.exitCode}`);
+  if (result.newOutput) { lines.push(`  Output:`); lines.push(result.newOutput); }
+  if (result.newErrors) { lines.push(`  Errors:`); lines.push(result.newErrors); }
+  if (!result.newOutput && !result.newErrors) lines.push("  (no new output since last check)");
+  return { success: true, output: lines.join("\n") };
+}
+
+function taskStop(input: Record<string, unknown>): ToolResult {
+  const taskId = input.task_id as string;
+  if (!taskId) return { success: false, output: "task_id is required" };
+
+  // Check if it's a background agent
+  if (taskId.startsWith("agent-")) {
+    const result = stopBackgroundAgent(taskId);
+    return { success: result.success, output: result.message };
+  }
+
+  // Fall back to shell kill
+  const result = killProcess(taskId);
+  return { success: result.success, output: result.message };
 }
 
 // ============================================================================

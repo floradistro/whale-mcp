@@ -9,9 +9,9 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { join, dirname } from "path";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import {
   LOCAL_TOOL_DEFINITIONS,
   executeLocalTool,
@@ -28,16 +28,20 @@ import {
 import { createTurnContext, logSpan, generateSpanId, generateTraceId, getTurnNumber } from "./telemetry.js";
 import { loadClaudeMd, classifyToolError } from "./agent-loop.js";
 import { getGlobalEmitter } from "./agent-events.js";
+import { getAgentDefinition } from "./agent-definitions.js";
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-export type SubagentType =
+export type BuiltinSubagentType =
   | "explore"           // Fast codebase exploration
   | "plan"              // Planning complex implementations
   | "general-purpose"   // Multi-step autonomous tasks
   | "research";         // Documentation lookups, web research
+
+// Accepts built-in types + custom agent names from .whale/agents/
+export type SubagentType = BuiltinSubagentType | (string & {});
 
 export interface ParentTraceContext {
   traceId: string;      // 32 hex chars - inherited from parent
@@ -53,6 +57,9 @@ export interface SubagentOptions {
   subagent_type: SubagentType;
   model?: "sonnet" | "opus" | "haiku";
   resume?: string;               // Agent ID to resume from
+  run_in_background?: boolean;   // Write output to file, return immediately
+  max_turns?: number;            // Override default MAX_TURNS (clamped 1-50)
+  name?: string;                 // Display name for agent
   parentContext?: string;        // Summary of parent conversation for context
   parentTraceContext?: ParentTraceContext;  // W3C trace context for hierarchical spans
 }
@@ -97,13 +104,17 @@ const MAX_OUTPUT_TOKENS = 8192;
 // ============================================================================
 
 // Build agent prompt with working directory context
-function buildAgentPrompt(type: SubagentType, cwd: string): string {
+function buildAgentPrompt(type: SubagentType | string, cwd: string): string {
   const cwdContext = `
 ## Working Directory
 You are working in: ${cwd}
 All file paths should be relative to or absolute from this directory.
 IMPORTANT: Focus ONLY on files within this directory. Do not get confused by other projects.
 `;
+
+  // Check for custom agent definition first
+  const custom = getAgentDefinition(type);
+  if (custom) return custom.prompt + cwdContext;
 
   const prompts: Record<SubagentType, string> = {
     explore: `You are an exploration agent. Your ONLY job is to quickly find specific information in the codebase, then STOP.
@@ -275,7 +286,11 @@ function generateAgentId(): string {
 // TOOL FILTERING — restrict tools per agent type
 // ============================================================================
 
-function getToolsForAgent(type: SubagentType): string[] {
+function getToolsForAgent(type: SubagentType | string): string[] {
+  // Check for custom agent definition with explicit tools
+  const custom = getAgentDefinition(type);
+  if (custom?.tools && custom.tools.length > 0) return custom.tools;
+
   switch (type) {
     case "explore":
       return ["glob", "grep", "read_file", "list_directory", "search_files", "search_content"];
@@ -607,19 +622,20 @@ function yieldForRender(): Promise<void> {
 }
 
 export async function runSubagent(options: SubagentOptions): Promise<SubagentResult> {
-  const { prompt, subagent_type, model = "sonnet", resume, parentContext, parentTraceContext } = options;
+  const { prompt, subagent_type, model = "sonnet", resume, max_turns, name, parentContext, parentTraceContext } = options;
 
   const agentId = resume || generateAgentId();
   const modelId = MODEL_MAP[model] || MODEL_MAP.sonnet;
   const cwd = process.cwd();
   const systemPrompt = buildAgentPrompt(subagent_type, cwd);
   const startTime = Date.now();
+  const effectiveMaxTurns = max_turns ? Math.max(1, Math.min(50, max_turns)) : MAX_TURNS;
 
   // Extract short description from prompt (first sentence or 60 chars)
   const descMatch = prompt.match(/^[^.!?\n]+/);
-  const shortDescription = descMatch
+  const shortDescription = name || (descMatch
     ? descMatch[0].slice(0, 60) + (descMatch[0].length > 60 ? "…" : "")
-    : prompt.slice(0, 60) + (prompt.length > 60 ? "…" : "");
+    : prompt.slice(0, 60) + (prompt.length > 60 ? "…" : ""));
 
   // Emit subagent start event
   const emitter = getGlobalEmitter();
@@ -672,7 +688,7 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
     serviceVersion: "2.1.0",
     model: modelId,
     agentId,
-    agentName: `subagent-${subagent_type}`,
+    agentName: name || `subagent-${subagent_type}`,
     // Inherit parent's trace to keep hierarchy intact
     traceId: parentTraceContext?.traceId || generateTraceId(),
     spanId: subagentSpanId,
@@ -685,7 +701,7 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
   };
 
   try {
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
+    for (let turn = 0; turn < effectiveMaxTurns; turn++) {
       // Emit progress and yield before API call to keep UI responsive
       emitSubagentProgress(subagent_type, agentId, `turn ${turn + 1}: calling API...`, turn + 1);
       await yieldForRender(); // Give Ink time to render the progress update
@@ -918,6 +934,33 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
       toolsUsed: state.toolsUsed,
     };
   }
+}
+
+// ============================================================================
+// BACKGROUND AGENT EXECUTION
+// ============================================================================
+
+export async function runSubagentBackground(options: SubagentOptions): Promise<{ agentId: string; outputFile: string }> {
+  const agentId = options.resume || generateAgentId();
+  const outputFile = join(tmpdir(), `whale-agent-${agentId}.output`);
+
+  // Write initial status
+  writeFileSync(outputFile, `Agent ${agentId} started (${options.subagent_type})\n`, "utf-8");
+
+  // Import background process tracker (dynamic to avoid circular deps)
+  const bgModule = await import("./background-processes.js");
+  bgModule.registerBackgroundAgent(agentId, options.subagent_type, outputFile);
+
+  // Start agent in detached async — don't await
+  runSubagent({ ...options, resume: undefined }).then(result => {
+    appendFileSync(outputFile, `\n---DONE---\n${JSON.stringify({ success: result.success, agentId: result.agentId, output: result.output })}\n`, "utf-8");
+    import("./background-processes.js").then(m => m.markAgentDone(agentId, result.success));
+  }).catch(err => {
+    appendFileSync(outputFile, `\n---ERROR---\n${err.message}\n`, "utf-8");
+    import("./background-processes.js").then(m => m.markAgentDone(agentId, false));
+  });
+
+  return { agentId, outputFile };
 }
 
 // ============================================================================

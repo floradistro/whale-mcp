@@ -172,6 +172,8 @@ const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
   kill_shell: "command",
   list_shells: "command",
   notebook_edit: "notebook",
+  task_output: "agent",
+  task_stop: "agent",
 };
 
 function getToolCategory(name: string): ToolCategory {
@@ -199,6 +201,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   kill_shell: "TaskStop",
   list_shells: "Tasks",
   notebook_edit: "NotebookEdit",
+  task_output: "TaskOutput",
+  task_stop: "TaskStop",
 };
 
 export function getDisplayName(name: string): string {
@@ -333,13 +337,13 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           <Text color={catStyle.color}><Spinner type="dots" /></Text>
           <Text color={catStyle.color}> {catStyle.icon}</Text>
           <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-          {context ? <Text color="#86868B">  {context}</Text> : null}
+          {context ? <Text dimColor>  {context}</Text> : null}
         </Box>
         {/* Live streaming output for running commands */}
         {liveLines.length > 0 && (
           <Box flexDirection="column" marginLeft={4}>
             {liveLines.map((line, i) => (
-              <Text key={i} color="#6E6E73" wrap="truncate">{line}</Text>
+              <Text key={i} dimColor wrap="truncate">{line}</Text>
             ))}
           </Box>
         )}
@@ -355,8 +359,8 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           <Text color="#FF453A" bold>✕</Text>
           <Text color={catStyle.color}> {catStyle.icon}</Text>
           <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-          {context ? <Text color="#86868B">  {context}</Text> : null}
-          {durationMs !== undefined && <Text color="#48484A">  {formatDuration(durationMs)}</Text>}
+          {context ? <Text dimColor>  {context}</Text> : null}
+          {durationMs !== undefined && <Text dimColor>  {formatDuration(durationMs)}</Text>}
         </Box>
         {result && (
           <Box marginLeft={2}>
@@ -379,9 +383,11 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
         <Text color="#30D158">✓</Text>
         <Text color={catStyle.color}> {catStyle.icon}</Text>
         <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-        {context ? <Text color="#86868B">  {context}</Text> : null}
+        {context ? <Text dimColor>  {context}</Text> : null}
         {durationMs !== undefined && (
-          <Text color={durationMs > 3000 ? "#FF9F0A" : "#48484A"}>  {formatDuration(durationMs)}</Text>
+          durationMs > 3000
+            ? <Text color="#FF9F0A">  {formatDuration(durationMs)}</Text>
+            : <Text dimColor>  {formatDuration(durationMs)}</Text>
         )}
         {/* Inline summary badges */}
         {summary?.type === "edit" && (
@@ -391,15 +397,15 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           </>
         )}
         {summary?.type === "search" && (
-          <Text color="#6E6E73">  {summary.matches} match{summary.matches !== 1 ? "es" : ""}{summary.files > 0 ? ` in ${summary.files} file${summary.files !== 1 ? "s" : ""}` : ""}</Text>
+          <Text dimColor>  {summary.matches} match{summary.matches !== 1 ? "es" : ""}{summary.files > 0 ? ` in ${summary.files} file${summary.files !== 1 ? "s" : ""}` : ""}</Text>
         )}
         {(summary?.type === "read" || summary?.type === "write" || summary?.type === "command" || summary?.type === "directory" || summary?.type === "web") && (
-          <Text color="#6E6E73">  {(summary as any).label}</Text>
+          <Text dimColor>  {(summary as any).label}</Text>
         )}
         {summary?.type === "server" && (
           <Text color="#64D2FF">  {(summary as any).label}</Text>
         )}
-        {!summary && hasResult && !isShort && !expanded && <Text color="#6E6E73">  {lineCount} lines</Text>}
+        {!summary && hasResult && !isShort && !expanded && <Text dimColor>  {lineCount} lines</Text>}
       </Box>
 
       {/* Result — full, syntax highlighted */}
@@ -414,9 +420,9 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
         <Box flexDirection="column" marginLeft={2}>
           <MarkdownText text={wrapInFence(result!.split("\n").slice(0, PREVIEW_LINES).join("\n"), lang, filePath)} />
           <Box>
-            <Text color="#48484A">  └ </Text>
-            <Text color="#6E6E73">+{lineCount - PREVIEW_LINES} lines</Text>
-            <Text color="#48484A">  ^E</Text>
+            <Text dimColor>  └ </Text>
+            <Text dimColor>+{lineCount - PREVIEW_LINES} lines</Text>
+            <Text dimColor>  ^E</Text>
           </Box>
         </Box>
       )}

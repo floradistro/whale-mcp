@@ -121,15 +121,15 @@ export const CompletedMessage = React.memo(function CompletedMessage({ msg, inde
           {msg.usage && (
             <Text>
               {"  "}
-              <Text color="#48484A">
+              <Text dimColor>
                 {formatTokens(msg.usage.input_tokens)}
                 <Text color="#5E5CE6">↑</Text>
                 {" "}{formatTokens(msg.usage.output_tokens)}
                 <Text color="#BF5AF2">↓</Text>
               </Text>
-              <Text color="#38383A">  {estimateCost(msg.usage.input_tokens, msg.usage.output_tokens)}</Text>
+              <Text dimColor>  {estimateCost(msg.usage.input_tokens, msg.usage.output_tokens)}</Text>
               {msg.toolCalls && msg.toolCalls.length > 0 ? (
-                <Text color="#38383A">
+                <Text dimColor>
                   {"  "}{msg.toolCalls.length} tool{msg.toolCalls.length !== 1 ? "s" : ""}
                   {"  "}{formatMs(totalToolDuration(msg.toolCalls))}
                 </Text>

@@ -18,6 +18,7 @@ import {
 } from "../services/agent-loop.js";
 import { getAllServerToolDefinitions, resetServerToolClient } from "../services/server-tools.js";
 import { LOCAL_TOOL_DEFINITIONS, loadTodos, setTodoSessionId } from "../services/local-tools.js";
+import { loadAgentDefinitions } from "../services/agent-definitions.js";
 import { AgentEventEmitter, type AgentEvent } from "../services/agent-events.js";
 import { CompletedMessage, type ChatMessage, type ToolCall } from "./MessageList.js";
 import { ToolIndicator } from "./ToolIndicator.js";
@@ -321,6 +322,26 @@ export function ChatApp() {
             setMessages((prev) => [...prev, { role: "assistant", text: "  Failed to load session." }]);
           }
         }
+        break;
+      }
+
+      case "/agents": {
+        const builtIn = ["explore", "plan", "general-purpose", "research"];
+        const custom = loadAgentDefinitions();
+        const lines: string[] = [];
+        lines.push("  Built-in:");
+        for (const a of builtIn) lines.push(`    ${a.padEnd(20)} (built-in)`);
+        if (custom.length > 0) {
+          lines.push("");
+          lines.push("  Custom:");
+          for (const a of custom) {
+            lines.push(`    ${a.name.padEnd(20)} ${a.description || `(${a.source})`}`);
+          }
+        } else {
+          lines.push("");
+          lines.push("  No custom agents. Add .md files to .whale/agents/ or ~/.swagmanager/agents/");
+        }
+        setMessages((prev) => [...prev, { role: "assistant", text: lines.join("\n") }]);
         break;
       }
 
@@ -726,7 +747,7 @@ export function ChatApp() {
             <Text>
               <Text color="#0A84FF">  </Text>
               <Text color="#0A84FF"><Spinner type="dots" /></Text>
-              <Text color="#6E6E73">  {randomVerb()}</Text>
+              <Text dimColor>  {randomVerb()}</Text>
             </Text>
           )}
 
