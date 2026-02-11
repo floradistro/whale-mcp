@@ -1,16 +1,15 @@
 /**
- * ChatInput — clean input with slash command menu
+ * ChatInput — Claude Code-style input with full-width divider
  *
- * "/" triggers a select menu. Esc/backspace dismisses.
- * Minimal chrome, Apple-style focus states.
+ * Full-width ─ divider above prompt. "/" triggers slash command menu.
+ * Clean, minimal chrome. Edge-to-edge divider for visual separation.
  */
 
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 import SelectInput from "ink-select-input";
-import Spinner from "ink-spinner";
-import { colors, symbols } from "../shared/Theme.js";
+import { colors } from "../shared/Theme.js";
 
 export interface SlashCommand {
   name: string;
@@ -38,6 +37,11 @@ interface ChatInputProps {
   onCommand: (command: string) => void;
   disabled: boolean;
   agentName?: string;
+}
+
+function dividerLine(): string {
+  const w = (process.stdout.columns || 80) - 2;
+  return "─".repeat(Math.max(20, w));
 }
 
 export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInputProps) {
@@ -73,11 +77,14 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
     setValue("");
   };
 
-  // Thinking state — smooth spinner
+  const divider = dividerLine();
+
+  // Disabled during streaming — divider + minimal indicator
   if (disabled) {
     return (
-      <Box>
-        <Text color={colors.brand}><Spinner type="dots" /></Text>
+      <Box flexDirection="column">
+        <Text>{" "}</Text>
+        <Text color={colors.separator}>{divider}</Text>
       </Box>
     );
   }
@@ -91,6 +98,8 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
 
     return (
       <Box flexDirection="column">
+        <Text>{" "}</Text>
+        <Text color={colors.separator}>{divider}</Text>
         <SelectInput
           items={items}
           onSelect={handleMenuSelect}
@@ -102,12 +111,12 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
           itemComponent={({ isSelected, label }) => {
             const cmd = SLASH_COMMANDS.find((c) => c.name === label);
             return (
-              <Box>
+              <Text>
                 <Text color={isSelected ? colors.brand : colors.secondary} bold={isSelected}>
                   {label}
                 </Text>
                 <Text color={colors.tertiary}>  {cmd?.description}</Text>
-              </Box>
+              </Text>
             );
           }}
         />
@@ -116,16 +125,20 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
     );
   }
 
-  // Normal input
+  // Normal input — divider + prompt
   return (
-    <Box>
-      <Text color={colors.brand} bold>{symbols.user} </Text>
-      <TextInput
-        value={value}
-        onChange={handleChange}
-        onSubmit={handleSubmit}
-        placeholder={`Message ${agentName || "whale"}, or /`}
-      />
+    <Box flexDirection="column">
+      <Text>{" "}</Text>
+      <Text color={colors.separator}>{divider}</Text>
+      <Box>
+        <Text color="#E5E5EA" bold>{">"} </Text>
+        <TextInput
+          value={value}
+          onChange={handleChange}
+          onSubmit={handleSubmit}
+          placeholder={`Message ${agentName || "whale"}, or type / for commands`}
+        />
+      </Box>
     </Box>
   );
 }

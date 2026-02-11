@@ -415,35 +415,43 @@ const handlers: Record<string, ToolHandler> = {
 
         case "velocity": {
           const days = (args.days as number) || 30;
-          const startDate = new Date();
-          startDate.setDate(startDate.getDate() - days);
+          const categoryId = args.category_id as string;
+          const productId = args.product_id as string;
+          const locationId = args.location_id as string;
+          const limit = (args.limit as number) || 50;
 
-          const { data, error } = await supabase
-            .from("order_items")
-            .select("product_id, quantity, products(name, sku)")
-            .gte("created_at", startDate.toISOString())
-            .limit(200);
+          // Use the proper RPC function with category/location/product filters
+          const { data, error } = await supabase.rpc("get_product_velocity", {
+            p_store_id: storeId || null,
+            p_days: days,
+            p_location_id: locationId || null,
+            p_category_id: categoryId || null,
+            p_product_id: productId || null,
+            p_limit: limit
+          });
 
           if (error) return { success: false, error: error.message };
 
-          const productSales: Record<string, { name: string; sku: string; totalQty: number }> = {};
-          for (const item of data || []) {
-            const pid = item.product_id;
-            if (!productSales[pid]) {
-              productSales[pid] = {
-                name: (item.products as any)?.name || "Unknown",
-                sku: (item.products as any)?.sku || "",
-                totalQty: 0
-              };
-            }
-            productSales[pid].totalQty += item.quantity || 0;
-          }
+          // Transform RPC result rows (column names from TABLE return type)
+          const products = (data || []).map((row: any) => ({
+            productId: row.product_id,
+            name: row.product_name,
+            sku: row.product_sku,
+            category: row.category_name,
+            locationId: row.location_id,
+            locationName: row.location_name,
+            totalQty: row.units_sold,
+            totalRevenue: row.revenue,
+            orderCount: row.order_count,
+            velocityPerDay: row.daily_velocity,
+            revenuePerDay: row.daily_revenue,
+            currentStock: row.current_stock,
+            daysOfStock: row.days_of_stock,
+            avgPrice: row.avg_unit_price,
+            stockAlert: row.stock_status
+          }));
 
-          const sorted = Object.entries(productSales)
-            .map(([id, p]) => ({ productId: id, ...p, velocityPerDay: Math.round((p.totalQty / days) * 100) / 100 }))
-            .sort((a, b) => b.totalQty - a.totalQty);
-
-          return { success: true, data: { days, products: sorted.slice(0, 50) } };
+          return { success: true, data: { days, filters: { categoryId, locationId, productId }, products } };
         }
 
         case "by_location": {
@@ -476,7 +484,7 @@ const handlers: Record<string, ToolHandler> = {
         }
 
         default:
-          return { success: false, error: `Unknown action: ${action}. Use: summary, velocity, by_location, in_stock` };
+          return { success: false, error: `Unknown action: ${action}. Use: summary, velocity (supports category_id, location_id, product_id, days, limit), by_location, in_stock` };
       }
     } catch (err) {
       return { success: false, error: `Inventory query error: ${err}` };
@@ -571,7 +579,14 @@ const handlers: Record<string, ToolHandler> = {
               .eq("id", po.id);
           }
 
-          return { success: true, data: { purchase_order_id: po.id, po_number: poNumber, items_count: items.length } };
+          // Fetch enriched PO with location name, supplier, and item details
+          const { data: enriched } = await supabase
+            .from("purchase_orders")
+            .select("id, po_number, status, total_amount, expected_delivery_date, created_at, notes, location:locations(name, city, state), items:purchase_order_items(quantity, unit_price, subtotal, product:products(name, sku))")
+            .eq("id", po.id)
+            .single();
+
+          return { success: true, data: enriched || { purchase_order_id: po.id, po_number: poNumber, items_count: items.length } };
         }
 
         case "list": {
@@ -940,9 +955,16 @@ const handlers: Record<string, ToolHandler> = {
             .update({ status: "in_transit", shipped_at: new Date().toISOString() })
             .eq("id", transfer.id);
 
+          // Fetch enriched transfer with location names and item details
+          const { data: enriched } = await supabase
+            .from("inventory_transfers")
+            .select("id, transfer_number, status, created_at, shipped_at, from_location:locations!inventory_transfers_source_location_id_fkey(name, city, state), to_location:locations!inventory_transfers_destination_location_id_fkey(name, city, state), items:inventory_transfer_items(quantity, product:products(name, sku))")
+            .eq("id", transfer.id)
+            .single();
+
           return {
             success: true,
-            data: { transfer_id: transfer.id, transfer_number: transferNumber, items_count: itemsCount }
+            data: enriched || { transfer_id: transfer.id, transfer_number: transferNumber, items_count: itemsCount }
           };
         }
 
@@ -1909,6 +1931,122 @@ const handlers: Record<string, ToolHandler> = {
           };
         }
 
+        case "by_category": {
+          // Category-level sales breakdown using RPC
+          const days = daysBack || 30;
+          const { data, error } = await supabase.rpc("get_category_performance", {
+            p_store_id: storeId || null,
+            p_location_id: locationId || null,
+            p_days: days
+          });
+
+          if (error) return { success: false, error: error.message };
+
+          const categories = (data || []).map((row: any) => ({
+            categoryId: row.category_id,
+            categoryName: row.category_name,
+            orderCount: row.order_count,
+            totalGrams: row.total_grams,
+            totalRevenue: row.total_revenue,
+            avgPricePerGram: row.avg_price_per_gram,
+            revenueShare: row.revenue_share
+          }));
+
+          return {
+            success: true,
+            data: {
+              days,
+              locationId: locationId || "all",
+              categories,
+              totalRevenue: categories.reduce((s: number, c: any) => s + parseFloat(c.totalRevenue || 0), 0)
+            }
+          };
+        }
+
+        case "category_velocity": {
+          // Inventory velocity broken down by category with stock alerts
+          const days = daysBack || 30;
+          const categoryName = args.category_name as string;
+          const { data, error } = await supabase.rpc("get_inventory_velocity", {
+            p_store_id: storeId || null,
+            p_location_id: locationId || null,
+            p_category_name: categoryName || null,
+            p_days: days
+          });
+
+          if (error) return { success: false, error: error.message };
+
+          const results = (data || []).map((row: any) => ({
+            locationId: row.location_id,
+            locationName: row.location_name,
+            locationType: row.location_type,
+            categoryId: row.category_id,
+            categoryName: row.category_name,
+            currentStock: row.current_stock,
+            totalSold: row.sold_in_period,
+            dailyVelocity: row.daily_velocity,
+            daysOfStock: row.days_of_stock,
+            stockAlert: row.status
+          }));
+
+          return {
+            success: true,
+            data: {
+              days,
+              categoryFilter: categoryName || "all",
+              results
+            }
+          };
+        }
+
+        case "product_sales": {
+          // Product-level sales for a specific category or all products
+          const days = daysBack || 30;
+          const categoryId = args.category_id as string;
+          const productId = args.product_id as string;
+          const limit = (args.limit as number) || 50;
+
+          const { data, error } = await supabase.rpc("get_product_velocity", {
+            p_store_id: storeId || null,
+            p_days: days,
+            p_location_id: locationId || null,
+            p_category_id: categoryId || null,
+            p_product_id: productId || null,
+            p_limit: limit
+          });
+
+          if (error) return { success: false, error: error.message };
+
+          const products = (data || []).map((row: any) => ({
+            productId: row.product_id,
+            name: row.product_name,
+            sku: row.product_sku,
+            category: row.category_name,
+            locationId: row.location_id,
+            locationName: row.location_name,
+            totalQty: row.units_sold,
+            totalRevenue: row.revenue,
+            orderCount: row.order_count,
+            velocityPerDay: row.daily_velocity,
+            revenuePerDay: row.daily_revenue,
+            currentStock: row.current_stock,
+            daysOfStock: row.days_of_stock,
+            avgPrice: row.avg_unit_price,
+            stockAlert: row.stock_status
+          }));
+
+          return {
+            success: true,
+            data: {
+              days,
+              filters: { categoryId, locationId, productId },
+              products,
+              totalUnits: products.reduce((s: number, p: any) => s + parseFloat(p.totalQty || 0), 0),
+              totalRevenue: products.reduce((s: number, p: any) => s + parseFloat(p.totalRevenue || 0), 0)
+            }
+          };
+        }
+
         case "full":
         case "business_intelligence": {
           // Master intelligence - all metrics in one call
@@ -1922,7 +2060,7 @@ const handlers: Record<string, ToolHandler> = {
         }
 
         default:
-          return { success: false, error: `Unknown action: ${action}. Use: summary, by_location, detailed, discover, employee, customers, products, inventory_intelligence, marketing, fraud, employee_performance, behavior, full` };
+          return { success: false, error: `Unknown action: ${action}. Use: summary, by_location, detailed, by_category, category_velocity, product_sales, discover, employee, customers, products, inventory_intelligence, marketing, fraud, employee_performance, behavior, full` };
       }
     } catch (err) {
       return { success: false, error: `Analytics error: ${err}` };
@@ -2682,19 +2820,160 @@ const handlers: Record<string, ToolHandler> = {
   // ===========================================================================
   audit_trail: async (supabase, args, storeId) => {
     try {
-      const limit = (args.limit as number) || 50;
+      const action = (args.action as string) || "recent";
+      const limit = (args.limit as number) || 20;
+      const conversationId = args.conversation_id as string | undefined;
+      const timeWindow = (args.time_window as string) || "1h";
 
-      let q = supabase
-        .from("audit_logs")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(limit);
+      // Parse time window into a timestamp
+      const now = new Date();
+      const windowMs: Record<string, number> = { "1h": 3600000, "24h": 86400000, "7d": 604800000 };
+      const ms = windowMs[timeWindow] || windowMs["1h"];
+      const since = new Date(now.getTime() - ms).toISOString();
 
-      if (storeId) q = q.eq("store_id", storeId);
+      switch (action) {
+        case "recent": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, error_message, details, created_at")
+            .gte("created_at", since)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (conversationId) q = q.eq("conversation_id", conversationId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+          const rows = (data || []).map((r: any) => ({
+            action: r.action,
+            status: r.status_code,
+            duration_ms: r.duration_ms,
+            error: r.error_message || null,
+            tool: r.details?.tool_name || r.details?.["gen_ai.request.model"] || null,
+            time: r.created_at,
+          }));
+          return { success: true, data: { action: "recent", time_window: timeWindow, count: rows.length, entries: rows } };
+        }
 
-      const { data, error } = await q;
-      if (error) return { success: false, error: error.message };
-      return { success: true, data };
+        case "errors": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, error_message, status_code, severity, created_at")
+            .gte("created_at", since)
+            .or("severity.eq.error,status_code.eq.ERROR")
+            .order("created_at", { ascending: false })
+            .limit(limit);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (conversationId) q = q.eq("conversation_id", conversationId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          // Group by action
+          const grouped: Record<string, { count: number; last_error: string; last_time: string }> = {};
+          for (const r of (data || []) as any[]) {
+            const key = r.action;
+            if (!grouped[key]) {
+              grouped[key] = { count: 0, last_error: r.error_message || r.status_code, last_time: r.created_at };
+            }
+            grouped[key].count++;
+          }
+          return { success: true, data: { action: "errors", time_window: timeWindow, total_errors: (data || []).length, by_action: grouped } };
+        }
+
+        case "tool_stats": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, input_tokens, output_tokens, created_at")
+            .gte("created_at", since)
+            .like("action", "tool.%")
+            .order("created_at", { ascending: false })
+            .limit(500);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (conversationId) q = q.eq("conversation_id", conversationId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          const stats: Record<string, { calls: number; errors: number; total_ms: number; total_tokens: number }> = {};
+          for (const r of (data || []) as any[]) {
+            const tool = r.action.replace("tool.", "");
+            if (!stats[tool]) stats[tool] = { calls: 0, errors: 0, total_ms: 0, total_tokens: 0 };
+            stats[tool].calls++;
+            if (r.status_code === "ERROR") stats[tool].errors++;
+            stats[tool].total_ms += r.duration_ms || 0;
+            stats[tool].total_tokens += (r.input_tokens || 0) + (r.output_tokens || 0);
+          }
+          // Add avg_ms
+          const toolStats = Object.fromEntries(
+            Object.entries(stats).map(([k, v]) => [k, { ...v, avg_ms: Math.round(v.total_ms / v.calls) }])
+          );
+          return { success: true, data: { action: "tool_stats", time_window: timeWindow, tools: toolStats } };
+        }
+
+        case "team_status": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, details, created_at")
+            .gte("created_at", since)
+            .like("action", "team.%")
+            .order("created_at", { ascending: false })
+            .limit(200);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (conversationId) q = q.eq("conversation_id", conversationId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          const teammates: Record<string, { name: string; started: string | null; done: string | null; tasks_completed: number }> = {};
+          for (const r of (data || []) as any[]) {
+            const id = r.details?.teammate_id;
+            if (!id) continue;
+            if (!teammates[id]) teammates[id] = { name: r.details?.teammate_name || id, started: null, done: null, tasks_completed: 0 };
+            if (r.action === "team.teammate_start") teammates[id].started = r.created_at;
+            if (r.action === "team.teammate_done") teammates[id].done = r.created_at;
+            if (r.action === "team.task_complete") teammates[id].tasks_completed++;
+          }
+          // Flag stuck teammates (started but no done event)
+          const stuck = Object.entries(teammates)
+            .filter(([, v]) => v.started && !v.done)
+            .map(([id, v]) => ({ id, name: v.name, started: v.started }));
+          return { success: true, data: { action: "team_status", time_window: timeWindow, teammates, stuck_teammates: stuck } };
+        }
+
+        case "cost_summary": {
+          let q = supabase
+            .from("audit_logs")
+            .select("input_tokens, output_tokens, created_at")
+            .gte("created_at", since)
+            .not("input_tokens", "is", null)
+            .order("created_at", { ascending: false })
+            .limit(1000);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (conversationId) q = q.eq("conversation_id", conversationId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          let totalIn = 0, totalOut = 0;
+          for (const r of (data || []) as any[]) {
+            totalIn += r.input_tokens || 0;
+            totalOut += r.output_tokens || 0;
+          }
+          // Rough cost estimate (Sonnet pricing: $3/MTok in, $15/MTok out)
+          const costEstimate = (totalIn / 1_000_000) * 3 + (totalOut / 1_000_000) * 15;
+          return {
+            success: true,
+            data: {
+              action: "cost_summary",
+              time_window: timeWindow,
+              api_calls: (data || []).length,
+              input_tokens: totalIn,
+              output_tokens: totalOut,
+              total_tokens: totalIn + totalOut,
+              estimated_cost_usd: `$${costEstimate.toFixed(4)}`,
+            },
+          };
+        }
+
+        default:
+          return { success: false, error: `Unknown audit_trail action: ${action}. Use: recent, errors, tool_stats, team_status, cost_summary` };
+      }
     } catch (err) {
       return { success: false, error: `Audit trail error: ${err}` };
     }

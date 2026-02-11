@@ -16,8 +16,25 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { dirname, join } from "path";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { homedir } from "os";
+import {
+  runSubagent,
+  type SubagentType,
+  type ParentTraceContext,
+} from "./subagent.js";
+import {
+  createTurnContext,
+  getTurnNumber,
+} from "./telemetry.js";
+import {
+  runAgentTeam,
+  TeamLead,
+  type TeamConfig,
+} from "./team-lead.js";
+import { isRgAvailable, rgGrep, rgGlob } from "./ripgrep.js";
+import { spawnBackground, readProcessOutput, killProcess, listProcesses } from "./background-processes.js";
+import { getGlobalEmitter } from "./agent-events.js";
 
 // ============================================================================
 // TYPES
@@ -43,6 +60,8 @@ export interface ToolResult {
 // ============================================================================
 
 let todoState: Array<{ id: string; content: string; status: string; activeForm?: string }> = [];
+let todoSessionId: string | null = null;
+const TODOS_DIR = join(homedir(), ".swagmanager", "todos");
 
 // ============================================================================
 // TOOL NAMES
@@ -63,6 +82,13 @@ export const LOCAL_TOOL_NAMES = new Set([
   "notebook_edit",
   "web_fetch",
   "todo_write",
+  "multi_edit", // Multi-edit tool
+  "task", // Subagent tool
+  "team_create", // Agent team tool
+  // Background process tools
+  "bash_output",
+  "kill_shell",
+  "list_shells",
 ]);
 
 export function isLocalTool(name: string): boolean {
@@ -79,20 +105,21 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   // ------------------------------------------------------------------
   {
     name: "read_file",
-    description: "Read file contents. Supports line-based pagination for large files.",
+    description: "Read file contents. Supports line-based pagination for large files. Reads images (png/jpg/gif/webp) as visual content. Extracts text from PDFs. For multiple files, emit all read_file calls in one response — they execute in parallel.",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Absolute or relative path to the file" },
         offset: { type: "number", description: "Line number to start reading from (1-based). Omit to read from start." },
         limit: { type: "number", description: "Max number of lines to read. Omit to read all." },
+        pages: { type: "string", description: "Page range for PDFs (e.g. '1-5', '3', '10-20'). Only for .pdf files." },
       },
       required: ["path"],
     },
   },
   {
     name: "write_file",
-    description: "Write content to a file, creating it and parent directories if needed",
+    description: "Write content to a file, creating it and parent directories if needed. For multiple independent files, emit all write_file calls in one response.",
     input_schema: {
       type: "object",
       properties: {
@@ -155,7 +182,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   },
   {
     name: "run_command",
-    description: "Execute a shell command with configurable timeout and safety checks",
+    description: "Execute a shell command. Output streams live. Use run_in_background:true for dev servers/watchers — after starting, use bash_output to verify the server is running.",
     input_schema: {
       type: "object",
       properties: {
@@ -163,6 +190,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
         working_directory: { type: "string", description: "Working directory for the command" },
         timeout: { type: "number", description: "Timeout in milliseconds (default 30000, max 300000)" },
         description: { type: "string", description: "Short description of what this command does" },
+        run_in_background: { type: "boolean", description: "Run in background (for dev servers, watchers). Returns process ID immediately." },
       },
       required: ["command"],
     },
@@ -173,7 +201,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   // ------------------------------------------------------------------
   {
     name: "glob",
-    description: "Fast file pattern matching. Use glob patterns like '**/*.ts' or 'src/**/*.tsx'. Returns matching file paths.",
+    description: "Fast file pattern matching. Use glob patterns like '**/*.ts' or 'src/**/*.tsx'. Returns matching file paths. For multiple patterns, emit all glob calls in one response.",
     input_schema: {
       type: "object",
       properties: {
@@ -189,7 +217,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   // ------------------------------------------------------------------
   {
     name: "grep",
-    description: "Search file contents with regex, context lines, and multiple output modes. More powerful than search_content.",
+    description: "Search file contents with regex, context lines, and multiple output modes. More powerful than search_content. For multiple patterns, emit all grep calls in one response.",
     input_schema: {
       type: "object",
       properties: {
@@ -207,6 +235,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
         case_insensitive: { type: "boolean", description: "Case insensitive search (default false)" },
         type: { type: "string", description: "File type shorthand: js, ts, py, go, rust, java, etc." },
         head_limit: { type: "number", description: "Max results to return (default 200)" },
+        multiline: { type: "boolean", description: "Enable multiline mode where . matches newlines (requires rg)" },
       },
       required: ["pattern"],
     },
@@ -273,6 +302,142 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
       required: ["todos"],
     },
   },
+  // ------------------------------------------------------------------
+  // NEW: MULTI_EDIT — multiple edits to one file in a single call
+  // ------------------------------------------------------------------
+  {
+    name: "multi_edit",
+    description: "Apply multiple edits to one file in a single call. Edits applied sequentially. Fails if any old_string not found.",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string", description: "Absolute or relative path to the file" },
+        edits: {
+          type: "array",
+          description: "Array of edits to apply sequentially",
+          items: {
+            type: "object",
+            properties: {
+              old_string: { type: "string", description: "Exact text to find" },
+              new_string: { type: "string", description: "Text to replace with" },
+            },
+            required: ["old_string", "new_string"],
+          },
+        },
+      },
+      required: ["file_path", "edits"],
+    },
+  },
+  // ------------------------------------------------------------------
+  // TASK — subagent for discrete tasks
+  // ------------------------------------------------------------------
+  {
+    name: "task",
+    description: "Launch a subagent that runs in isolated context and returns a summary when done. Use for discrete tasks completable in 2-6 turns.",
+    input_schema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "Specific task with clear completion criteria" },
+        subagent_type: {
+          type: "string",
+          enum: ["explore", "plan", "general-purpose", "research"],
+          description: "Agent type: explore=find, plan=design, general-purpose=do, research=lookup",
+        },
+        model: {
+          type: "string",
+          enum: ["sonnet", "opus", "haiku"],
+          description: "Haiku for quick tasks, Sonnet (default) for most, Opus for complex",
+        },
+      },
+      required: ["prompt", "subagent_type"],
+    },
+  },
+  // ------------------------------------------------------------------
+  // TEAM — parallel agent team for large tasks
+  // ------------------------------------------------------------------
+  {
+    name: "team_create",
+    description: "Create and run an Agent Team — multiple Claude instances working in parallel. Each teammate runs in separate context, claims tasks from a shared list, and has full tool access. Size tasks for 5-6 items per teammate. Include file lists to prevent conflicts.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Team name (e.g., 'Feature Implementation Team')",
+        },
+        teammate_count: {
+          type: "number",
+          description: "Number of teammates to spawn (2-5 recommended)",
+        },
+        model: {
+          type: "string",
+          enum: ["sonnet", "opus", "haiku"],
+          description: "Model for all teammates (default: sonnet)",
+        },
+        tasks: {
+          type: "array",
+          description: "Tasks for the team to complete",
+          items: {
+            type: "object",
+            properties: {
+              description: {
+                type: "string",
+                description: "Clear task description with completion criteria",
+              },
+              files: {
+                type: "array",
+                items: { type: "string" },
+                description: "Files this task will modify (for conflict prevention)",
+              },
+              dependencies: {
+                type: "array",
+                items: { type: "string" },
+                description: "Task descriptions that must complete first",
+              },
+            },
+            required: ["description"],
+          },
+        },
+      },
+      required: ["name", "teammate_count", "tasks"],
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // BACKGROUND PROCESS TOOLS
+  // ------------------------------------------------------------------
+  {
+    name: "bash_output",
+    description: "Read output from a running or completed background shell process. Returns only NEW output since the last read.",
+    input_schema: {
+      type: "object",
+      properties: {
+        bash_id: { type: "string", description: "The process ID returned when starting the background process" },
+        filter: { type: "string", description: "Optional regex to filter output lines" },
+      },
+      required: ["bash_id"],
+    },
+  },
+  {
+    name: "kill_shell",
+    description: "Terminate a running background shell process",
+    input_schema: {
+      type: "object",
+      properties: {
+        shell_id: { type: "string", description: "The process ID to kill" },
+      },
+      required: ["shell_id"],
+    },
+  },
+  {
+    name: "list_shells",
+    description: "List all background shell processes (running and recent completed)",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
 // ============================================================================
@@ -295,19 +460,26 @@ export async function executeLocalTool(
   try {
     switch (name) {
       // Enhanced originals
-      case "read_file":       return readFile(input);
+      case "read_file":       return await readFile(input);
       case "write_file":      return writeFile(input);
       case "edit_file":       return editFile(input);
       case "list_directory":  return listDirectory(input);
       case "search_files":    return searchFiles(input);
       case "search_content":  return searchContent(input);
-      case "run_command":     return runCommand(input);
+      case "run_command":     return await runCommand(input);
+      // Background process tools
+      case "bash_output":     return bashOutput(input);
+      case "kill_shell":      return killShell(input);
+      case "list_shells":     return listShells();
       // New tools
       case "glob":            return globSearch(input);
       case "grep":            return grepSearch(input);
       case "notebook_edit":   return notebookEdit(input);
       case "web_fetch":       return await webFetch(input);
       case "todo_write":      return todoWrite(input);
+      case "multi_edit":      return multiEdit(input);
+      case "task":            return await taskTool(input);
+      case "team_create":     return await teamCreateTool(input);
       default:                return { success: false, output: `Unknown local tool: ${name}` };
     }
   } catch (err) {
@@ -319,10 +491,62 @@ export async function executeLocalTool(
 // ORIGINAL TOOLS (enhanced)
 // ============================================================================
 
-function readFile(input: Record<string, unknown>): ToolResult {
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+const IMAGE_MEDIA_TYPES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp",
+};
+
+async function readFile(input: Record<string, unknown>): Promise<ToolResult> {
   const path = resolvePath(input.path as string);
   if (!existsSync(path)) return { success: false, output: `File not found: ${path}` };
 
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+
+  // Image files → base64 with marker for agent-loop to convert to image content block
+  if (IMAGE_EXTENSIONS.has(ext)) {
+    try {
+      const buffer = readFileSync(path);
+      const base64 = buffer.toString("base64");
+      const mediaType = IMAGE_MEDIA_TYPES[ext] || "image/png";
+      return { success: true, output: `__IMAGE__${mediaType}__${base64}` };
+    } catch (err) {
+      return { success: false, output: `Failed to read image: ${err}` };
+    }
+  }
+
+  // PDF files → extract text
+  if (ext === "pdf") {
+    try {
+      const pdfParse = (await import("pdf-parse")).default;
+      const buffer = readFileSync(path);
+      const data = await pdfParse(buffer);
+
+      let text = data.text || "";
+      const totalPages = data.numpages || 0;
+      const pagesParam = input.pages as string | undefined;
+
+      // Apply page range filter if specified
+      if (pagesParam && text) {
+        const pageTexts = text.split(/\f/); // Form feed splits pages in most PDFs
+        const { start, end } = parsePageRange(pagesParam, pageTexts.length);
+        text = pageTexts.slice(start, end).join("\n\n---\n\n");
+      }
+
+      if (text.length > 100_000) {
+        text = text.slice(0, 100_000) + `\n\n... (truncated)`;
+      }
+
+      return {
+        success: true,
+        output: `PDF: ${path} (${totalPages} pages)\n\n${text}`,
+      };
+    } catch (err) {
+      return { success: false, output: `Failed to parse PDF: ${err}` };
+    }
+  }
+
+  // Text files — existing behavior
   const content = readFileSync(path, "utf-8");
   const lines = content.split("\n");
 
@@ -334,7 +558,6 @@ function readFile(input: Record<string, unknown>): ToolResult {
     const endIdx = limit ? startIdx + limit : lines.length;
     const slice = lines.slice(startIdx, endIdx);
 
-    // Format with line numbers like `cat -n`
     const numbered = slice.map((line, i) => {
       const lineNum = startIdx + i + 1;
       return `${String(lineNum).padStart(6)}  ${line}`;
@@ -347,20 +570,37 @@ function readFile(input: Record<string, unknown>): ToolResult {
     return { success: true, output };
   }
 
-  // Full file read with truncation
   if (content.length > 100_000) {
     return { success: true, output: content.slice(0, 100_000) + `\n\n... (truncated, ${content.length} total chars)` };
   }
   return { success: true, output: content };
 }
 
+function parsePageRange(range: string, totalPages: number): { start: number; end: number } {
+  const parts = range.split("-");
+  const start = Math.max(0, parseInt(parts[0], 10) - 1);
+  const end = parts.length > 1 ? Math.min(totalPages, parseInt(parts[1], 10)) : start + 1;
+  return { start, end };
+}
+
 function writeFile(input: Record<string, unknown>): ToolResult {
   const path = resolvePath(input.path as string);
   const content = input.content as string;
+  const existed = existsSync(path);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, content, "utf-8");
-  return { success: true, output: `File written: ${path} (${content.length} chars)` };
+
+  // Show content preview (like Claude Code)
+  const lines = content.split("\n");
+  const previewMax = 20;
+  const preview = lines.slice(0, previewMax).map(l => `+ ${l}`);
+  if (lines.length > previewMax) preview.push(`... (+${lines.length - previewMax} more lines)`);
+
+  return {
+    success: true,
+    output: `${existed ? "Updated" : "Created"}: ${path} (${lines.length} lines, ${content.length} chars)\n${preview.join("\n")}`,
+  };
 }
 
 function editFile(input: Record<string, unknown>): ToolResult {
@@ -388,7 +628,57 @@ function editFile(input: Record<string, unknown>): ToolResult {
   const idx = content.indexOf(oldString);
   content = content.slice(0, idx) + newString + content.slice(idx + oldString.length);
   writeFileSync(path, content, "utf-8");
-  return { success: true, output: `File edited: ${path}` };
+
+  // Compact diff output
+  const oldLines = oldString.split("\n");
+  const newLines = newString.split("\n");
+  const diffParts: string[] = [];
+  const showMax = 10;
+  for (const l of oldLines.slice(0, showMax)) diffParts.push(`- ${l}`);
+  if (oldLines.length > showMax) diffParts.push(`... (${oldLines.length - showMax} more lines removed)`);
+  for (const l of newLines.slice(0, showMax)) diffParts.push(`+ ${l}`);
+  if (newLines.length > showMax) diffParts.push(`... (${newLines.length - showMax} more lines added)`);
+  const diff = diffParts.length > 0 ? `\n${diffParts.join("\n")}` : "";
+
+  return { success: true, output: `File edited: ${path}${diff}` };
+}
+
+function multiEdit(input: Record<string, unknown>): ToolResult {
+  const path = resolvePath(input.file_path as string);
+  const edits = input.edits as Array<{ old_string: string; new_string: string }>;
+
+  if (!existsSync(path)) return { success: false, output: `File not found: ${path}` };
+  if (!Array.isArray(edits) || edits.length === 0) return { success: false, output: "edits array is required and must not be empty" };
+
+  let content = readFileSync(path, "utf-8");
+  const diffLines: string[] = [];
+
+  for (let i = 0; i < edits.length; i++) {
+    const { old_string, new_string } = edits[i];
+    const idx = content.indexOf(old_string);
+    if (idx === -1) {
+      return {
+        success: false,
+        output: `Edit ${i + 1}/${edits.length} failed: old_string not found (${i} edits applied successfully before failure)`,
+      };
+    }
+    content = content.slice(0, idx) + new_string + content.slice(idx + old_string.length);
+
+    // Build compact diff (first ~3 lines of each side)
+    const oldPreview = old_string.split("\n").slice(0, 3);
+    const newPreview = new_string.split("\n").slice(0, 3);
+    diffLines.push(`  #${i + 1}:`);
+    for (const l of oldPreview) diffLines.push(`    - ${l}`);
+    if (old_string.split("\n").length > 3) diffLines.push(`    ... (${old_string.split("\n").length} lines)`);
+    for (const l of newPreview) diffLines.push(`    + ${l}`);
+    if (new_string.split("\n").length > 3) diffLines.push(`    ... (${new_string.split("\n").length} lines)`);
+  }
+
+  writeFileSync(path, content, "utf-8");
+  return {
+    success: true,
+    output: `Applied ${edits.length} edits to ${path}\n${diffLines.join("\n")}`,
+  };
 }
 
 function listDirectory(input: Record<string, unknown>): ToolResult {
@@ -443,25 +733,126 @@ function searchContent(input: Record<string, unknown>): ToolResult {
   }
 }
 
-function runCommand(input: Record<string, unknown>): ToolResult {
+async function runCommand(input: Record<string, unknown>): Promise<ToolResult> {
   const command = input.command as string;
   const cwd = input.working_directory ? resolvePath(input.working_directory as string) : undefined;
   const timeout = Math.min((input.timeout as number) || 30000, 300000);
+  const background = input.run_in_background as boolean;
 
   const dangerous = ["rm -rf /", "rm -rf ~", "mkfs", "dd if=", "> /dev/sd"];
   if (dangerous.some((d) => command.includes(d))) {
     return { success: false, output: "Command blocked for safety" };
   }
 
-  try {
-    const output = execSync(command, {
-      encoding: "utf-8", timeout, cwd, maxBuffer: 1024 * 1024,
-    });
-    return { success: true, output: output || "(no output)" };
-  } catch (err: any) {
-    const stderr = err.stderr || err.stdout || String(err);
-    return { success: false, output: `Exit code ${err.status || "?"}: ${stderr}`.slice(0, 5000) };
+  // Background mode — spawn detached, validate, return with status
+  if (background) {
+    const result = await spawnBackground(command, { cwd, timeout: 600_000, description: input.description as string });
+    return { success: result.status === "running", output: result.message };
   }
+
+  // Foreground async — spawn + stream output via events
+  return new Promise<ToolResult>((resolve) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let killed = false;
+
+    const child = spawn(command, [], {
+      shell: true,
+      cwd,
+      env: { ...process.env, FORCE_COLOR: "0" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const emitter = getGlobalEmitter();
+
+    child.stdout?.on("data", (data: Buffer) => {
+      const text = data.toString();
+      stdout.push(text);
+      // Emit live output for UI streaming
+      for (const line of text.split("\n")) {
+        if (line.trim()) emitter.emitToolOutput("run_command", line);
+      }
+    });
+
+    child.stderr?.on("data", (data: Buffer) => {
+      const text = data.toString();
+      stderr.push(text);
+      for (const line of text.split("\n")) {
+        if (line.trim()) emitter.emitToolOutput("run_command", line);
+      }
+    });
+
+    // Timeout kill
+    const timer = setTimeout(() => {
+      if (!killed) {
+        killed = true;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 3000);
+      }
+    }, timeout);
+
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      const output = stdout.join("") + (stderr.length > 0 ? "\n" + stderr.join("") : "");
+      if (killed) {
+        resolve({ success: false, output: `Command timed out after ${timeout}ms.\n${output}`.slice(0, 5000) });
+      } else if (code === 0) {
+        resolve({ success: true, output: output || "(no output)" });
+      } else {
+        resolve({ success: false, output: `Exit code ${code ?? "?"}:\n${output}`.slice(0, 5000) });
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ success: false, output: `Spawn error: ${err.message}` });
+    });
+  });
+}
+
+// Background tool handlers
+function bashOutput(input: Record<string, unknown>): ToolResult {
+  const id = input.bash_id as string;
+  const filter = input.filter as string | undefined;
+  const result = readProcessOutput(id, { filter });
+  if ("error" in result) return { success: false, output: result.error };
+
+  const statusIcon = result.status === "running" ? "●" : result.status === "completed" ? "✓" : "✕";
+  const statusColor = result.status === "running" ? "running" : result.status === "completed" ? "completed" : "failed";
+  const lines: string[] = [];
+  lines.push(`${statusIcon} Process ${id} — ${statusColor}`);
+  if (result.exitCode !== undefined) lines.push(`  Exit code: ${result.exitCode}`);
+  if (result.newOutput) {
+    lines.push(`  Output:`);
+    lines.push(result.newOutput);
+  }
+  if (result.newErrors) {
+    lines.push(`  Errors:`);
+    lines.push(result.newErrors);
+  }
+  if (!result.newOutput && !result.newErrors) lines.push("  (no new output since last check)");
+  return { success: true, output: lines.join("\n") };
+}
+
+function killShell(input: Record<string, unknown>): ToolResult {
+  const id = (input.shell_id || input.bash_id) as string;
+  const result = killProcess(id);
+  return { success: result.success, output: result.message };
+}
+
+function listShells(): ToolResult {
+  const procs = listProcesses();
+  if (procs.length === 0) return { success: true, output: "No background processes." };
+  const lines: string[] = [`${procs.length} background process${procs.length !== 1 ? "es" : ""}:`, ""];
+  for (const p of procs) {
+    const icon = p.status === "running" ? "●" : p.status === "completed" ? "✓" : "✕";
+    lines.push(`  ${icon} ${p.id}  ${p.status}  ${p.runtime}`);
+    lines.push(`    ${p.command}`);
+    if (p.pid) lines.push(`    PID: ${p.pid}`);
+    lines.push(`    stdout: ${p.outputLines} lines  stderr: ${p.errorLines} lines`);
+    lines.push("");
+  }
+  return { success: true, output: lines.join("\n") };
 }
 
 // ============================================================================
@@ -476,13 +867,19 @@ function globSearch(input: Record<string, unknown>): ToolResult {
 
   if (!existsSync(basePath)) return { success: false, output: `Directory not found: ${basePath}` };
 
-  // Parse glob pattern into a directory prefix + name pattern
-  // Examples:
-  //   "**/*.ts"              → dir=basePath, name="*.ts"
-  //   "src/**/*.tsx"         → dir=basePath/src, name="*.tsx"
-  //   "*.json"               → dir=basePath, name="*.json"
-  //   "src/components/*.tsx"  → dir=basePath/src/components, name="*.tsx"
+  // Try ripgrep first for speed
+  if (isRgAvailable()) {
+    try {
+      const result = rgGlob({ pattern, path: basePath, headLimit: 200 });
+      if (result === null) return { success: true, output: "No files found" };
+      const files = result.split("\n").filter(Boolean);
+      return { success: true, output: `${files.length} files:\n${result}` };
+    } catch {
+      // Fall through to find
+    }
+  }
 
+  // Fallback: system find
   let searchDir = basePath;
   let namePattern = pattern;
 
@@ -495,7 +892,6 @@ function globSearch(input: Record<string, unknown>): ToolResult {
     }
   }
 
-  // Handle brace expansion: *.{ts,tsx} → -name '*.ts' -o -name '*.tsx'
   let findCmd: string;
   const braceMatch = namePattern.match(/\{([^}]+)\}/);
 
@@ -535,34 +931,61 @@ function grepSearch(input: Record<string, unknown>): ToolResult {
   const caseInsensitive = input.case_insensitive as boolean | undefined;
   const fileType = input.type as string | undefined;
   const headLimit = (input.head_limit as number) || 200;
+  const multiline = input.multiline as boolean | undefined;
 
-  // Build grep command
-  const parts: string[] = ["grep", "-r"];
+  // Try ripgrep first
+  if (isRgAvailable()) {
+    try {
+      const result = rgGrep({
+        pattern,
+        path,
+        outputMode: outputMode as "content" | "files_with_matches" | "count",
+        glob: globFilter,
+        type: fileType,
+        caseInsensitive: caseInsensitive || false,
+        multiline: multiline || false,
+        context: contextLines,
+        before: beforeLines,
+        after: afterLines,
+        headLimit,
+      });
 
-  // Case sensitivity
-  if (caseInsensitive) parts.push("-i");
+      if (result === null) return { success: true, output: "No matches found" };
 
-  // Output mode
-  switch (outputMode) {
-    case "files_with_matches":
-      parts.push("-l");
-      break;
-    case "count":
-      parts.push("-c");
-      break;
-    case "content":
-      parts.push("-n"); // always show line numbers for content
-      break;
+      // For count mode, filter zero-count files
+      if (outputMode === "count") {
+        const lines = result.split("\n").filter((l) => !l.endsWith(":0"));
+        return { success: true, output: lines.join("\n") || "No matches found" };
+      }
+
+      return { success: true, output: result };
+    } catch {
+      // Fall through to system grep
+    }
   }
 
-  // Context (only meaningful for content mode)
+  // Multiline requires rg — can't do with system grep
+  if (multiline) {
+    return { success: false, output: "Multiline search requires ripgrep (rg). Install: brew install ripgrep" };
+  }
+
+  // Fallback: system grep
+  const parts: string[] = ["grep", "-r"];
+
+  if (caseInsensitive) parts.push("-i");
+
+  switch (outputMode) {
+    case "files_with_matches": parts.push("-l"); break;
+    case "count": parts.push("-c"); break;
+    case "content": parts.push("-n"); break;
+  }
+
   if (outputMode === "content") {
     if (contextLines) parts.push(`-C ${contextLines}`);
     if (beforeLines) parts.push(`-B ${beforeLines}`);
     if (afterLines) parts.push(`-A ${afterLines}`);
   }
 
-  // File type filter
   const typeMap: Record<string, string> = {
     js: "*.js", ts: "*.ts", tsx: "*.tsx", jsx: "*.jsx",
     py: "*.py", rust: "*.rs", go: "*.go", java: "*.java",
@@ -578,10 +1001,8 @@ function grepSearch(input: Record<string, unknown>): ToolResult {
     parts.push(`--include='${typeMap[fileType]}'`);
   }
 
-  // Exclude common dirs
   parts.push("--exclude-dir='node_modules'", "--exclude-dir='.git'", "--exclude-dir='dist'");
 
-  // Pattern (escape single quotes)
   const escaped = pattern.replace(/'/g, "'\\''");
   parts.push(`'${escaped}'`, `'${path}'`);
 
@@ -592,7 +1013,6 @@ function grepSearch(input: Record<string, unknown>): ToolResult {
     const result = output.trim();
     if (!result) return { success: true, output: "No matches found" };
 
-    // For count mode, filter out zero-count files
     if (outputMode === "count") {
       const lines = result.split("\n").filter((l) => !l.endsWith(":0"));
       return { success: true, output: lines.join("\n") || "No matches found" };
@@ -730,13 +1150,17 @@ async function webFetch(input: Record<string, unknown>): Promise<ToolResult> {
   }
 }
 
-/** Simple HTML → readable text/markdown converter */
+/** Enhanced HTML → readable text/markdown converter */
 function htmlToText(html: string): string {
   return html
-    // Remove scripts, styles, head, nav, footer
+    // Remove scripts, styles, head, nav, footer, aside, HTML comments
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
     .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
+    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, "")
+    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, "")
+    .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
     // Convert headings to markdown
     .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, level, content) =>
       "\n" + "#".repeat(parseInt(level)) + " " + stripTags(content).trim() + "\n\n"
@@ -745,11 +1169,38 @@ function htmlToText(html: string): string {
     .replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, text) =>
       `[${stripTags(text).trim()}](${href})`
     )
+    // Convert tables to pipe-delimited
+    .replace(/<table[^>]*>([\s\S]*?)<\/table>/gi, (_, tableContent) => {
+      const rows: string[] = [];
+      const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+      let rowMatch;
+      let isFirstRow = true;
+      while ((rowMatch = rowRegex.exec(tableContent)) !== null) {
+        const cells: string[] = [];
+        const cellRegex = /<(?:td|th)[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
+        let cellMatch;
+        while ((cellMatch = cellRegex.exec(rowMatch[1])) !== null) {
+          cells.push(stripTags(cellMatch[1]).trim());
+        }
+        if (cells.length > 0) {
+          rows.push("| " + cells.join(" | ") + " |");
+          if (isFirstRow) {
+            rows.push("| " + cells.map(() => "---").join(" | ") + " |");
+            isFirstRow = false;
+          }
+        }
+      }
+      return "\n" + rows.join("\n") + "\n";
+    })
     // Convert list items
     .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, content) => "- " + stripTags(content).trim() + "\n")
-    // Convert paragraphs and divs
+    // Convert paragraphs, divs, br
     .replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_, content) => stripTags(content).trim() + "\n\n")
+    .replace(/<div[^>]*>([\s\S]*?)<\/div>/gi, (_, content) => stripTags(content).trim() + "\n")
     .replace(/<br\s*\/?>/gi, "\n")
+    // Images → alt text
+    .replace(/<img[^>]*alt="([^"]*)"[^>]*>/gi, (_, alt) => `[${alt}]`)
+    .replace(/<img[^>]*>/gi, "")
     // Bold, italic
     .replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**")
     .replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*")
@@ -758,7 +1209,7 @@ function htmlToText(html: string): string {
     .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, "\n```\n$1\n```\n")
     // Strip remaining tags
     .replace(/<[^>]+>/g, "")
-    // Decode entities
+    // Decode entities (including hex)
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -766,8 +1217,10 @@ function htmlToText(html: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&#x27;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)))
     // Clean up whitespace
+    .replace(/ {2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -788,6 +1241,8 @@ function todoWrite(input: Record<string, unknown>): ToolResult {
     status: t.status,
     activeForm: t.activeForm,
   }));
+
+  persistTodos();
 
   const statusIcon: Record<string, string> = {
     pending: "[ ]",
@@ -811,7 +1266,149 @@ function todoWrite(input: Record<string, unknown>): ToolResult {
   };
 }
 
+/** Persist todos to disk (fire-and-forget) */
+function persistTodos(): void {
+  if (!todoSessionId) return;
+  try {
+    if (!existsSync(TODOS_DIR)) mkdirSync(TODOS_DIR, { recursive: true });
+    writeFileSync(join(TODOS_DIR, `${todoSessionId}.json`), JSON.stringify(todoState, null, 2), "utf-8");
+  } catch { /* best effort */ }
+}
+
+/** Load todos from disk for a session */
+export function loadTodos(sessionId: string): void {
+  const path = join(TODOS_DIR, `${sessionId}.json`);
+  if (!existsSync(path)) return;
+  try {
+    const data = JSON.parse(readFileSync(path, "utf-8"));
+    if (Array.isArray(data)) {
+      todoState = data;
+      todoSessionId = sessionId;
+    }
+  } catch { /* skip corrupted */ }
+}
+
+/** Link todos to a session for persistence */
+export function setTodoSessionId(id: string): void {
+  todoSessionId = id;
+}
+
 /** Get current todo state (for UI display) */
 export function getTodoState(): typeof todoState {
   return todoState;
+}
+
+// ============================================================================
+// TASK TOOL — subagent execution
+// ============================================================================
+
+/** Create parent trace context for subagent hierarchy (inherits current turn number) */
+function getParentTraceContext(): ParentTraceContext {
+  const ctx = createTurnContext();
+  return {
+    traceId: ctx.traceId!,
+    spanId: ctx.spanId!,
+    conversationId: ctx.conversationId,
+    turnNumber: getTurnNumber(), // Get current turn number directly
+    userId: ctx.userId,
+    userEmail: ctx.userEmail,
+  };
+}
+
+async function taskTool(input: Record<string, unknown>): Promise<ToolResult> {
+  const prompt = input.prompt as string;
+  const subagent_type = input.subagent_type as SubagentType;
+  const model = (input.model as "sonnet" | "opus" | "haiku") || "haiku";
+
+  if (!prompt) return { success: false, output: "prompt is required" };
+  if (!subagent_type) return { success: false, output: "subagent_type is required" };
+
+  try {
+    const result = await runSubagent({
+      prompt,
+      subagent_type,
+      model,
+      parentTraceContext: getParentTraceContext(),
+    });
+
+    return {
+      success: result.success,
+      output: result.output,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      output: `Task failed: ${err.message || err}`,
+    };
+  }
+}
+
+// ============================================================================
+// TEAM CREATE TOOL
+// ============================================================================
+
+async function teamCreateTool(input: Record<string, unknown>): Promise<ToolResult> {
+  const name = input.name as string;
+  const teammateCount = input.teammate_count as number;
+  const model = (input.model as "sonnet" | "opus" | "haiku") || "sonnet";
+  const tasksInput = input.tasks as Array<{
+    description: string;
+    files?: string[];
+    dependencies?: string[];
+  }>;
+
+  if (!name) return { success: false, output: "name is required" };
+  if (!teammateCount || teammateCount < 1) {
+    return { success: false, output: "teammate_count must be at least 1" };
+  }
+  if (!tasksInput || tasksInput.length === 0) {
+    return { success: false, output: "tasks array is required and must not be empty" };
+  }
+
+  // Validate task count vs teammate count
+  if (tasksInput.length < teammateCount) {
+    return {
+      success: false,
+      output: `Not enough tasks (${tasksInput.length}) for ${teammateCount} teammates. Add more tasks or reduce teammates.`,
+    };
+  }
+
+  const config: TeamConfig = {
+    name,
+    teammateCount,
+    model,
+    tasks: tasksInput,
+  };
+
+  try {
+    const result = await runAgentTeam(config);
+
+    // Build summary output
+    const lines: string[] = [
+      `## Team: ${name}`,
+      `Status: ${result.success ? "SUCCESS" : "PARTIAL"}`,
+      `Duration: ${(result.durationMs / 1000).toFixed(1)}s`,
+      `Tokens: ${result.tokensUsed.input} in, ${result.tokensUsed.output} out`,
+      "",
+      "### Task Results",
+    ];
+
+    for (const task of result.taskResults) {
+      const icon = task.status === "completed" ? "[done]" : "[fail]";
+      lines.push(`${icon} ${task.description}`);
+      if (task.result) {
+        lines.push(`    ${task.result.slice(0, 200)}${task.result.length > 200 ? "..." : ""}`);
+      }
+    }
+
+    return {
+      success: result.success,
+      output: lines.join("\n"),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      output: `Team failed: ${err.message || err}`,
+    };
+  }
 }

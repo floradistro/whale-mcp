@@ -1,16 +1,16 @@
 /**
- * MessageList — polished conversation layout
+ * MessageList — types and CompletedMessage component
  *
- * Generous spacing, subtle separators.
- * Tool calls render with full syntax highlighting.
+ * CompletedMessage is React.memo'd to prevent re-renders during streaming.
  * Telemetry footer: tokens, cost estimate, tool count.
+ * Minimal Box usage — Text-first for reliable rendering.
  */
 
 import React from "react";
 import { Box, Text } from "ink";
-import { StreamingText } from "./StreamingText.js";
 import { ToolIndicator } from "./ToolIndicator.js";
 import { MarkdownText } from "./MarkdownText.js";
+import { CompletedSubagentTree, type CompletedSubagentInfo } from "./SubagentPanel.js";
 import { colors, symbols } from "../shared/Theme.js";
 
 // ============================================================================
@@ -29,22 +29,14 @@ export interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   toolCalls?: ToolCall[];
+  completedSubagents?: CompletedSubagentInfo[];
   usage?: { input_tokens: number; output_tokens: number };
-}
-
-interface MessageListProps {
-  messages: ChatMessage[];
-  streamingText: string;
-  isStreaming: boolean;
-  activeTools: ToolCall[];
-  toolsExpanded: boolean;
 }
 
 // ============================================================================
 // HELPERS
 // ============================================================================
 
-/** Estimate cost: Sonnet 4 pricing — $3/MTok in, $15/MTok out */
 function estimateCost(input: number, output: number): string {
   const cost = (input * 3 + output * 15) / 1_000_000;
   if (cost < 0.001) return "<$0.001";
@@ -52,14 +44,12 @@ function estimateCost(input: number, output: number): string {
   return `$${cost.toFixed(3)}`;
 }
 
-/** Format token count: 1234 → 1.2k, 12345 → 12.3k */
 function formatTokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
   return `${Math.round(n / 1000)}k`;
 }
 
-/** Total duration across tool calls */
 function totalToolDuration(toolCalls: ToolCall[]): number {
   return toolCalls.reduce((sum, tc) => sum + (tc.durationMs || 0), 0);
 }
@@ -71,76 +61,39 @@ function formatMs(ms: number): string {
 }
 
 // ============================================================================
-// COMPONENT
+// COMPLETED MESSAGE — memoized, never re-renders during streaming
 // ============================================================================
 
-export function MessageList({ messages, streamingText, isStreaming, activeTools, toolsExpanded }: MessageListProps) {
+export const CompletedMessage = React.memo(function CompletedMessage({ msg, index, toolsExpanded }: {
+  msg: ChatMessage;
+  index: number;
+  toolsExpanded: boolean;
+}) {
+  const contentWidth = Math.max(20, (process.stdout.columns || 80) - 2);
+
   return (
     <Box flexDirection="column">
-      {messages.map((msg, i) => (
-        <Box key={i} flexDirection="column" marginBottom={1}>
-          {msg.role === "user" ? (
-            <Box>
-              <Text color={colors.brand} bold>{symbols.user} </Text>
-              <Text color={colors.user}>{msg.text}</Text>
-            </Box>
-          ) : (
-            <Box flexDirection="column">
-              {/* Tool calls */}
-              {msg.toolCalls && msg.toolCalls.length > 0 && (
-                <Box flexDirection="column" marginLeft={2} marginBottom={msg.text ? 1 : 0}>
-                  {msg.toolCalls.map((tc, j) => (
-                    <ToolIndicator
-                      key={j}
-                      name={tc.name}
-                      status={tc.status}
-                      result={tc.result}
-                      input={tc.input}
-                      durationMs={tc.durationMs}
-                      expanded={toolsExpanded}
-                    />
-                  ))}
-                </Box>
-              )}
-
-              {/* Response text */}
-              {msg.text && (
-                <Box marginLeft={2}>
-                  <MarkdownText text={msg.text} />
-                </Box>
-              )}
-
-              {/* Telemetry footer */}
-              {msg.usage && (
-                <Box marginLeft={2} marginTop={0}>
-                  <Text color="#48484A">
-                    {formatTokens(msg.usage.input_tokens)}
-                    <Text color="#5E5CE6">↑</Text>
-                    {" "}{formatTokens(msg.usage.output_tokens)}
-                    <Text color="#BF5AF2">↓</Text>
-                  </Text>
-                  <Text color="#38383A">  {estimateCost(msg.usage.input_tokens, msg.usage.output_tokens)}</Text>
-                  {msg.toolCalls && msg.toolCalls.length > 0 && (
-                    <Text color="#38383A">
-                      {"  "}{msg.toolCalls.length} tool{msg.toolCalls.length !== 1 ? "s" : ""}
-                      {"  "}{formatMs(totalToolDuration(msg.toolCalls))}
-                    </Text>
-                  )}
-                </Box>
-              )}
-            </Box>
-          )}
-        </Box>
-      ))}
-
-      {/* Active streaming */}
-      {(isStreaming || streamingText || activeTools.length > 0) && (
-        <Box flexDirection="column" marginBottom={1}>
-          {activeTools.length > 0 && (
-            <Box flexDirection="column" marginLeft={2} marginBottom={streamingText ? 1 : 0}>
-              {activeTools.map((tc, i) => (
+      {/* Turn separator before user messages (except first) */}
+      {msg.role === "user" && index > 0 && (
+        <>
+          <Text>{" "}</Text>
+          <Text color={colors.separator}>{"─".repeat(contentWidth)}</Text>
+        </>
+      )}
+      {msg.role === "user" ? (
+        <Text>
+          <Text color={colors.brand} bold>{symbols.user} </Text>
+          <Text color={colors.user}>{msg.text}</Text>
+        </Text>
+      ) : (
+        <Box flexDirection="column">
+          {/* Tool calls */}
+          {msg.toolCalls && msg.toolCalls.length > 0 && (
+            <Box flexDirection="column" marginLeft={2}>
+              {msg.toolCalls.map((tc, j) => (
                 <ToolIndicator
-                  key={i}
+                  key={j}
+                  id={`done-${index}-${j}`}
                   name={tc.name}
                   status={tc.status}
                   result={tc.result}
@@ -151,13 +104,40 @@ export function MessageList({ messages, streamingText, isStreaming, activeTools,
               ))}
             </Box>
           )}
-          {streamingText && (
+
+          {/* Completed subagent summary tree */}
+          {msg.completedSubagents && msg.completedSubagents.length > 0 && (
+            <CompletedSubagentTree agents={msg.completedSubagents} />
+          )}
+
+          {/* Response text */}
+          {msg.text && (
             <Box marginLeft={2}>
-              <StreamingText text={streamingText} isStreaming={isStreaming} />
+              <MarkdownText text={msg.text} />
             </Box>
+          )}
+
+          {/* Telemetry footer */}
+          {msg.usage && (
+            <Text>
+              {"  "}
+              <Text color="#48484A">
+                {formatTokens(msg.usage.input_tokens)}
+                <Text color="#5E5CE6">↑</Text>
+                {" "}{formatTokens(msg.usage.output_tokens)}
+                <Text color="#BF5AF2">↓</Text>
+              </Text>
+              <Text color="#38383A">  {estimateCost(msg.usage.input_tokens, msg.usage.output_tokens)}</Text>
+              {msg.toolCalls && msg.toolCalls.length > 0 ? (
+                <Text color="#38383A">
+                  {"  "}{msg.toolCalls.length} tool{msg.toolCalls.length !== 1 ? "s" : ""}
+                  {"  "}{formatMs(totalToolDuration(msg.toolCalls))}
+                </Text>
+              ) : null}
+            </Text>
           )}
         </Box>
       )}
     </Box>
   );
-}
+});

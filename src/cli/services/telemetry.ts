@@ -15,21 +15,48 @@ import type { ExecutionContext } from "../../tools/executor.js";
 // SESSION STATE
 // ============================================================================
 
-const conversationId = crypto.randomUUID();
+let conversationId: string = crypto.randomUUID();
 let turnNumber = 0;
+
+/**
+ * Set the conversation ID (used by worker threads to share parent's conversation)
+ */
+export function setConversationId(id: string): void {
+  conversationId = id;
+}
+
+/**
+ * Get the current conversation ID
+ */
+export function getConversationId(): string {
+  return conversationId;
+}
 let supabaseClient: SupabaseClient | null = null;
+
+/**
+ * Initialize the telemetry client with a specific auth token.
+ * Used by worker threads that receive the token from the parent.
+ */
+export function initializeTelemetryClient(authToken: string): void {
+  if (supabaseClient) return; // Already initialized
+
+  supabaseClient = createAuthenticatedClient(authToken);
+  if (process.env.DEBUG_TELEMETRY) {
+    process.stderr.write(`[telemetry] initialized client with provided auth token\n`);
+  }
+}
 
 // ============================================================================
 // W3C TRACE CONTEXT GENERATORS
 // ============================================================================
 
-function generateTraceId(): string {
+export function generateTraceId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-function generateSpanId(): string {
+export function generateSpanId(): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
@@ -49,6 +76,9 @@ async function getClient(): Promise<SupabaseClient | null> {
     supabaseClient = createClient(config.supabaseUrl, config.supabaseKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
+    if (process.env.DEBUG_TELEMETRY) {
+      process.stderr.write(`[telemetry] using service role key\n`);
+    }
     return supabaseClient;
   }
 
@@ -56,7 +86,16 @@ async function getClient(): Promise<SupabaseClient | null> {
   const token = await getValidToken();
   if (token) {
     supabaseClient = createAuthenticatedClient(token);
+    if (process.env.DEBUG_TELEMETRY) {
+      process.stderr.write(`[telemetry] using user JWT token\n`);
+    }
     return supabaseClient;
+  }
+
+  if (process.env.DEBUG_TELEMETRY) {
+    process.stderr.write(`[telemetry] NO CLIENT - no service key and no valid token\n`);
+    process.stderr.write(`[telemetry]   config.supabaseUrl: ${config.supabaseUrl}\n`);
+    process.stderr.write(`[telemetry]   config.supabaseKey: ${config.supabaseKey ? 'set' : 'not set'}\n`);
   }
 
   return null;
@@ -90,10 +129,6 @@ export function createTurnContext(overrides?: Partial<ExecutionContext>): Execut
   };
 }
 
-export function getConversationId(): string {
-  return conversationId;
-}
-
 export function getTurnNumber(): number {
   return turnNumber;
 }
@@ -113,19 +148,39 @@ export interface SpanOptions {
 }
 
 export function logSpan(opts: SpanOptions): void {
-  // Fire-and-forget — don't await, don't throw
-  _logSpan(opts).catch(() => {});
+  // Fire-and-forget — don't await, log errors in debug mode
+  _logSpan(opts).catch((err) => {
+    if (process.env.DEBUG_TELEMETRY) {
+      process.stderr.write(`[telemetry error] ${opts.action}: ${err.message}\n`);
+    }
+  });
 }
 
 async function _logSpan(opts: SpanOptions): Promise<void> {
+  if (process.env.DEBUG_TELEMETRY) {
+    process.stderr.write(`[telemetry] _logSpan called for ${opts.action}\n`);
+  }
+
   const client = await getClient();
-  if (!client) return;
+  if (!client) {
+    if (process.env.DEBUG_TELEMETRY) {
+      process.stderr.write(`[telemetry] no client for ${opts.action}\n`);
+    }
+    return;
+  }
 
   const now = new Date();
   const startTime = new Date(now.getTime() - opts.durationMs);
   const ctx = opts.context;
 
-  await client.from("audit_logs").insert({
+  // Debug: log team-related spans (only when DEBUG_TELEMETRY is set)
+  if (process.env.DEBUG_TELEMETRY && (opts.action.startsWith("team.") || opts.details?.parent_conversation_id)) {
+    process.stderr.write(`[telemetry:team] action=${opts.action}\n`);
+    process.stderr.write(`[telemetry:team]   conversation_id=${ctx.conversationId}\n`);
+    process.stderr.write(`[telemetry:team]   parent_conversation_id=${opts.details?.parent_conversation_id}\n`);
+  }
+
+  const { error } = await client.from("audit_logs").insert({
     action: opts.action,
     severity: opts.severity || (opts.error ? "error" : "info"),
     store_id: opts.storeId || null,
@@ -134,7 +189,8 @@ async function _logSpan(opts: SpanOptions): Promise<void> {
     resource_type: "cli_span",
     resource_id: opts.action,
     request_id: ctx.traceId,
-    parent_id: ctx.parentSpanId || null,
+    // parent_id is UUID type, but OTEL span IDs are not UUIDs - store in details instead
+    parent_id: null,
     duration_ms: opts.durationMs,
     error_message: opts.error || null,
 
@@ -149,19 +205,30 @@ async function _logSpan(opts: SpanOptions): Promise<void> {
     start_time: startTime.toISOString(),
     end_time: now.toISOString(),
 
-    // AI telemetry
+    // AI telemetry — use ?? to handle 0 correctly
     model: ctx.model || null,
-    input_tokens: ctx.inputTokens || null,
-    output_tokens: ctx.outputTokens || null,
-    total_cost: ctx.totalCost || null,
-    turn_number: ctx.turnNumber || null,
+    input_tokens: ctx.inputTokens ?? null,
+    output_tokens: ctx.outputTokens ?? null,
+    total_cost: ctx.totalCost ?? null,
+    turn_number: ctx.turnNumber ?? null,
     conversation_id: ctx.conversationId || null,
 
     details: {
       source: "whale_mcp",
-      conversation_id: conversationId,
-      turn_number: turnNumber,
+      conversation_id: ctx.conversationId || conversationId,
+      turn_number: ctx.turnNumber ?? turnNumber,
+      parent_span_id: ctx.parentSpanId || null,
       ...opts.details,
     },
   });
+
+  if (error) {
+    if (process.env.DEBUG_TELEMETRY) {
+      process.stderr.write(`[telemetry db error] ${opts.action}: ${error.message}\n`);
+      process.stderr.write(`[telemetry db error]   code: ${error.code}\n`);
+      process.stderr.write(`[telemetry db error]   hint: ${error.hint}\n`);
+    }
+  } else if (opts.details?.is_teammate && process.env.DEBUG_TELEMETRY) {
+    process.stderr.write(`[telemetry] teammate span logged: ${opts.action}\n`);
+  }
 }

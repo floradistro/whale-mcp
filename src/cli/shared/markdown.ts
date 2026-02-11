@@ -9,6 +9,10 @@
 import { marked } from "marked";
 import { markedTerminal } from "marked-terminal";
 import chalk from "chalk";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const { highlight } = require("cli-highlight") as typeof import("cli-highlight");
 
 // ============================================================================
 // Apple Dark palette
@@ -30,6 +34,15 @@ const tertiary     = chalk.hex("#6E6E73");
 const separator    = chalk.hex("#38383A");
 const lavender     = chalk.hex("#D4BBFF");
 const roseGold     = chalk.hex("#FFB5C2");
+
+// ============================================================================
+// OSC 8 hyperlinks — clickable in iTerm2, Warp, Kitty, WezTerm, etc.
+// ============================================================================
+
+function hyperlink(url: string, text?: string): string {
+  const display = text || url;
+  return `\x1B]8;;${url}\x07${systemCyan.underline(display)}\x1B]8;;\x07`;
+}
 
 // ============================================================================
 // Syntax highlighting — purples / blues / pinks
@@ -108,6 +121,10 @@ const appleTheme = {
 
 function colorizeFinancials(str: string): string {
   return str
+    // URLs → OSC 8 clickable hyperlinks (cyan underline)
+    .replace(/(https?:\/\/[^\s,)]+)/g, (m) => hyperlink(m))
+    // localhost with port → clickable hyperlink (auto-prefix http://)
+    .replace(/(localhost:\d+[^\s,)]*)/g, (m) => hyperlink(`http://${m}`, m))
     // Negative dollar amounts → red  (-$1,234.56)
     .replace(/(-\$[\d,]+\.?\d*)/g, (m) => systemRed(m))
     // Positive dollar amounts → green  ($1,234.56)
@@ -118,10 +135,10 @@ function colorizeFinancials(str: string): string {
     .replace(/((?:^|[^-])\d+\.?\d*%)/g, (m) => systemCyan(m))
     // Explicit positive → green
     .replace(/(\+\$?[\d,]+\.?\d*)/g, (m) => systemGreen(m))
-    // Words: profit, revenue, gain, increase → green
-    .replace(/\b(profit|revenue|gain|increase|in stock|available)\b/gi, (m) => systemGreen(m))
-    // Words: loss, deduction, decrease, cost, expense, out of stock → red
-    .replace(/\b(loss|deduction|decrease|deficit|expense|out of stock|low stock|overdue|expired|cancelled)\b/gi, (m) => systemRed(m));
+    // Words: profit, revenue, gain, increase, running, ready → green
+    .replace(/\b(profit|revenue|gain|increase|in stock|available|running|ready|started|listening|compiled)\b/gi, (m) => systemGreen(m))
+    // Words: loss, deduction, decrease, cost, expense, out of stock, failed → red
+    .replace(/\b(loss|deduction|decrease|deficit|expense|out of stock|low stock|overdue|expired|cancelled|failed|error|crashed|EADDRINUSE|ENOENT)\b/gi, (m) => systemRed(m));
 }
 
 // ============================================================================
@@ -145,9 +162,9 @@ marked.use(
       paragraph: (body: string) => colorizeFinancials(body),
       hr: () => separator("─".repeat(50)),
 
-      // Links
-      link: systemCyan,
-      href: systemCyan.underline,
+      // Links — OSC 8 clickable
+      link: (href: string) => hyperlink(href),
+      href: (href: string) => hyperlink(href),
 
       // Lists — purple bullets, financial-aware
       list: (body: string, ordered: boolean) => {
@@ -164,10 +181,10 @@ marked.use(
         return colorizeFinancials(itemText);
       },
 
-      // Layout
+      // Layout — adapt to terminal width
       reflowText: false,
       showSectionPrefix: false,
-      width: 80,
+      width: Math.min(120, process.stdout.columns || 80),
       tab: 2,
     } as any,
     {
@@ -177,6 +194,126 @@ marked.use(
     }
   )
 );
+
+// ============================================================================
+// Diff renderer — background colors + word-level diff (Claude Code parity)
+// ============================================================================
+
+// Background colors for diff lines
+const diffAddedBg    = chalk.bgHex("#1a3a2a").hex("#69DB7C");  // green bg, bright green text
+const diffRemovedBg  = chalk.bgHex("#3a1a1e").hex("#FFA8B4");  // red bg, pink text
+const diffAddedDim   = chalk.bgHex("#0d1f14").hex("#4a9e5a");  // dimmed green
+const diffRemovedDim = chalk.bgHex("#1f0d10").hex("#9e4a53");  // dimmed red
+const diffWordAdded  = chalk.bgHex("#2F9D44").hex("#FFFFFF");  // bright green bg for changed words
+const diffWordRemoved = chalk.bgHex("#D1454B").hex("#FFFFFF"); // bright red bg for changed words
+const dashBorder     = chalk.hex("#48484A");
+
+/** Compute word-level diff between two lines. Returns arrays of {text, changed} segments. */
+function wordDiff(oldLine: string, newLine: string): { old: {text: string; changed: boolean}[]; new: {text: string; changed: boolean}[] } {
+  const oldWords = oldLine.split(/(\s+)/);
+  const newWords = newLine.split(/(\s+)/);
+
+  // If lines are too different (>50% changed), skip word diff
+  const maxLen = Math.max(oldWords.length, newWords.length);
+  if (maxLen === 0) return { old: [{text: oldLine, changed: true}], new: [{text: newLine, changed: true}] };
+
+  // Simple LCS-based diff
+  let diffCount = 0;
+  const minLen = Math.min(oldWords.length, newWords.length);
+  for (let i = 0; i < minLen; i++) {
+    if (oldWords[i] !== newWords[i]) diffCount++;
+  }
+  diffCount += Math.abs(oldWords.length - newWords.length);
+
+  if (diffCount / maxLen > 0.5) {
+    return { old: [{text: oldLine, changed: true}], new: [{text: newLine, changed: true}] };
+  }
+
+  // Build segments
+  const oldSegs: {text: string; changed: boolean}[] = [];
+  const newSegs: {text: string; changed: boolean}[] = [];
+
+  for (let i = 0; i < maxLen; i++) {
+    const ow = oldWords[i] || "";
+    const nw = newWords[i] || "";
+    if (ow === nw) {
+      if (ow) { oldSegs.push({text: ow, changed: false}); newSegs.push({text: nw, changed: false}); }
+    } else {
+      if (ow) oldSegs.push({text: ow, changed: true});
+      if (nw) newSegs.push({text: nw, changed: true});
+    }
+  }
+
+  return { old: oldSegs, new: newSegs };
+}
+
+/** Render segments with word-level highlighting */
+function renderSegments(segs: {text: string; changed: boolean}[], wordStyle: (s: string) => string, lineStyle: (s: string) => string): string {
+  return segs.map(s => s.changed ? wordStyle(s.text) : lineStyle(s.text)).join("");
+}
+
+function renderDiff(code: string): string {
+  const lines = code.split("\n");
+  const gutterW = String(lines.length).length;
+  const termWidth = Math.min(120, process.stdout.columns || 80);
+  const contentWidth = termWidth - 4 - gutterW - 3; // indent + gutter + " │ "
+  const out: string[] = [];
+  let added = 0, removed = 0;
+
+  // Dashed top border
+  const dashLine = "  " + dashBorder("┄".repeat(Math.min(50, termWidth - 4)));
+
+  // Pair adjacent -/+ lines for word-level diff
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ln = tertiary(String(i + 1).padStart(gutterW)) + separator(" │ ");
+
+    if (line.startsWith("+")) {
+      // Check if previous line was a removal for word-level diff
+      const prevIdx = out.length > 0 ? i - 1 : -1;
+      const prevLine = prevIdx >= 0 ? lines[prevIdx] : null;
+
+      if (prevLine?.startsWith("-") && added > 0) {
+        // Word-level diff: re-render previous removal + this addition
+        const wd = wordDiff(prevLine.slice(1), line.slice(1));
+        const prevRendered = "  " + tertiary(String(i).padStart(gutterW)) + separator(" │ ") +
+          diffRemovedBg("-") + renderSegments(wd.old, diffWordRemoved, diffRemovedBg);
+        out[out.length - 1] = prevRendered; // Replace the previous line
+        const pad = Math.max(0, contentWidth - line.length);
+        out.push("  " + ln + diffAddedBg("+") + renderSegments(wd.new, diffWordAdded, diffAddedBg) + diffAddedBg(" ".repeat(pad)));
+      } else {
+        const pad = Math.max(0, contentWidth - line.length);
+        out.push("  " + ln + diffAddedBg(line) + diffAddedBg(" ".repeat(pad)));
+      }
+      added++;
+    } else if (line.startsWith("-")) {
+      const pad = Math.max(0, contentWidth - line.length);
+      out.push("  " + ln + diffRemovedBg(line) + diffRemovedBg(" ".repeat(pad)));
+      removed++;
+    } else if (line.startsWith("@@")) {
+      out.push("  " + ln + systemCyan(line));
+    } else {
+      out.push("  " + ln + diffAddedDim(line));
+    }
+  }
+
+  // Header with counts
+  const counts = (added > 0 || removed > 0)
+    ? " " + systemGreen(`+${added}`) + " " + systemRed(`-${removed}`) + " "
+    : " ";
+  const label = tertiary("diff");
+  const usedLen = 5 + 4 + (added > 0 || removed > 0 ? 4 + String(added).length + String(removed).length : 0);
+  const pad = Math.max(2, 48 - usedLen);
+  const header = separator("  ── ") + label + counts + separator("─".repeat(pad));
+
+  // Count summary line
+  const summaryParts: string[] = [];
+  if (added > 0) summaryParts.push(chalk.bold.hex("#69DB7C")(`${added} added`));
+  if (removed > 0) summaryParts.push(chalk.bold.hex("#FFA8B4")(`${removed} removed`));
+  const summary = summaryParts.length > 0 ? "  " + tertiary("  ") + summaryParts.join(tertiary(", ")) : "";
+
+  return "\n" + header + "\n" + dashLine + "\n" + out.join("\n") + "\n" + dashLine + summary + "\n";
+}
 
 // ============================================================================
 // Bar chart renderer — ```chart code blocks
@@ -226,7 +363,8 @@ function renderBarChart(code: string): string {
   const maxVal = Math.max(...entries.map(e => e.value));
   const maxLabel = Math.max(...entries.map(e => e.label.length));
   const maxRaw = Math.max(...entries.map(e => e.raw.length));
-  const barWidth = Math.min(36, Math.max(16, 56 - maxLabel - maxRaw));
+  const termWidth = process.stdout.columns || 80;
+  const barWidth = Math.min(36, Math.max(12, termWidth - 8 - maxLabel - maxRaw));
 
   const out: string[] = [];
 
@@ -259,10 +397,52 @@ function renderBarChart(code: string): string {
 // Table renderer — intercepts markdown tables before markedTerminal
 // ============================================================================
 
-function colorizeCell(val: string, isHeader: boolean): string {
+// Row tone detection for background tinting
+type RowTone = "positive" | "negative" | "neutral";
+
+function getRowTone(cells: string[]): RowTone {
+  for (const cell of cells) {
+    const t = cell.trim();
+    // Negative financial → red row
+    if (/^-\$[\d,]+/.test(t) || /^-\d+\.?\d*%/.test(t)) return "negative";
+    // Explicit positive delta → green row
+    if (/^\+\d/.test(t) || /^\+\$/.test(t)) return "positive";
+    // Status badges
+    if (/^`?[✕✗]/.test(t) || /cancelled|failed|rejected|error|out of stock|low stock/i.test(t)) return "negative";
+    if (/^`?[✓●]/.test(t) || /completed|received|approved|active|success|paid|published/i.test(t)) return "positive";
+  }
+  return "neutral";
+}
+
+// Background tints for row-level coloring
+const rowBgPositive = chalk.bgHex("#0d1f14");  // subtle green tint
+const rowBgNegative = chalk.bgHex("#1f0d10");  // subtle red tint
+
+function colorizeCell(val: string, isHeader: boolean, rowTone: RowTone = "neutral"): string {
   const trimmed = val.trim();
   if (!trimmed) return text("");
   if (isHeader) return systemIndigo.bold(trimmed);
+
+  // Badge format: `✓ status` or `◆ status` or `○ status` or `✕ status`
+  const badgeMatch = trimmed.match(/^`([✓●◆○✕◦])\s+(.+)`$/);
+  if (badgeMatch) {
+    const [, icon, label] = badgeMatch;
+    if (icon === "✓" || icon === "●") return systemGreen(`${icon} ${label}`);
+    if (icon === "◆") return systemCyan(`${icon} ${label}`);
+    if (icon === "○") return systemOrange(`${icon} ${label}`);
+    if (icon === "✕") return systemRed(`${icon} ${label}`);
+    return secondary(`${icon} ${label}`);
+  }
+
+  // Inline code (UUID, SKU, transfer number) — subtle style
+  if (trimmed.startsWith("`") && trimmed.endsWith("`")) {
+    return systemPurple(trimmed.slice(1, -1));
+  }
+
+  // Bold text
+  if (trimmed.startsWith("**") && trimmed.endsWith("**")) {
+    return text.bold(trimmed.slice(2, -2));
+  }
 
   // Negative values → red
   if (/^-\$?[\d,]+\.?\d*$/.test(trimmed) || /^-\d+\.?\d*%$/.test(trimmed)) {
@@ -290,6 +470,10 @@ function colorizeCell(val: string, isHeader: boolean): string {
   if (/^(pending|draft|processing)/i.test(trimmed)) {
     return systemOrange(trimmed);
   }
+
+  // Apply row tone tint to text cells
+  if (rowTone === "positive") return rowBgPositive(text(trimmed));
+  if (rowTone === "negative") return rowBgNegative(text(trimmed));
   return text(trimmed);
 }
 
@@ -312,11 +496,20 @@ function renderTable(token: any): string {
 
   if (headers.length === 0) return "";
 
-  // Calculate column widths (min 8, max 24)
+  // Responsive column widths based on terminal width
+  const termWidth = process.stdout.columns || 80;
+  const N = headers.length;
+  // Overhead: "  ╭" (3) + N+1 border chars + N*2 cell padding + "╮"
+  const overhead = 3 + (N + 1) + (N * 2);
+  const availableForContent = termWidth - overhead;
+  // Scale minimum column width down for narrow terminals
+  const minCol = termWidth < 70 ? 3 : termWidth < 90 ? 4 : 6;
+  const maxPerCol = Math.max(minCol, Math.floor(availableForContent / N));
+
   const colWidths = headers.map((h: string, i: number) => {
     const dataMax = rows.reduce((max: number, row: string[]) =>
       Math.max(max, (row[i] || "").length), 0);
-    return Math.min(24, Math.max(8, h.length, dataMax) + 2);
+    return Math.min(maxPerCol, Math.max(minCol, h.length, dataMax) + 2);
   });
 
   const border = chalk.hex("#48484A");
@@ -325,22 +518,29 @@ function renderTable(token: any): string {
   // Top border: ╭──────┬──────╮
   out.push(border("  ╭" + colWidths.map((w: number) => "─".repeat(w + 2)).join("┬") + "╮"));
 
-  // Header row
-  const hdrLine = headers.map((h: string, i: number) =>
-    " " + systemIndigo.bold(h.padEnd(colWidths[i])) + " "
-  ).join(border("│"));
+  // Header row (truncate headers to fit)
+  const hdrLine = headers.map((h: string, i: number) => {
+    const display = h.length > colWidths[i] ? h.slice(0, colWidths[i] - 1) + "…" : h;
+    return " " + systemIndigo.bold(display.padEnd(colWidths[i])) + " ";
+  }).join(border("│"));
   out.push(border("  │") + hdrLine + border("│"));
 
   // Header/body divider: ├──────┼──────┤
   out.push(border("  ├" + colWidths.map((w: number) => "─".repeat(w + 2)).join("┼") + "┤"));
 
-  // Data rows
+  // Data rows (truncate values to fit, with row-level background tinting)
   for (const row of rows) {
+    const tone = getRowTone(row);
     const cells = headers.map((_: string, i: number) => {
-      const val = row[i] || "";
-      const colored = colorizeCell(val, false);
-      const extraPad = Math.max(0, colWidths[i] - val.length);
-      return " " + colored + " ".repeat(extraPad) + " ";
+      const raw = row[i] || "";
+      const display = raw.length > colWidths[i] ? raw.slice(0, colWidths[i] - 1) + "…" : raw;
+      const colored = colorizeCell(display, false, tone);
+      const extraPad = Math.max(0, colWidths[i] - display.length);
+      const cellContent = " " + colored + " ".repeat(extraPad) + " ";
+      // Apply subtle background tint to the entire cell for positive/negative rows
+      if (tone === "positive") return rowBgPositive(cellContent);
+      if (tone === "negative") return rowBgNegative(cellContent);
+      return cellContent;
     }).join(border("│"));
     out.push(border("  │") + cells + border("│"));
   }
@@ -355,10 +555,42 @@ function renderTable(token: any): string {
 marked.use({
   renderer: {
     code(this: any, token: any) {
-      const lang = (typeof token === "object" ? token.lang : arguments[1]) || "";
+      const rawLang = (typeof token === "object" ? token.lang : arguments[1]) || "";
       const code = typeof token === "object" ? token.text : token;
+
+      // Parse lang:subtitle (e.g. "typescript:src/foo.ts")
+      const colonIdx = rawLang.indexOf(":");
+      const lang = colonIdx > 0 ? rawLang.slice(0, colonIdx) : rawLang;
+      const subtitle = colonIdx > 0 ? rawLang.slice(colonIdx + 1) : "";
+
       if (lang === "chart" || lang === "bar") {
         return renderBarChart(code);
+      }
+      if (lang === "diff") {
+        return renderDiff(code);
+      }
+      if (lang) {
+        // Build header: ── lang ── subtitle ──────
+        let header: string;
+        if (subtitle) {
+          const pad = Math.max(2, 44 - lang.length - subtitle.length);
+          header = separator("  ── ") + tertiary(lang) + separator(" ── ") + secondary(subtitle) + separator(` ${"─".repeat(pad)}`);
+        } else {
+          header = separator("  ── ") + tertiary(lang) + separator(` ${"─".repeat(Math.max(2, 46 - lang.length))}`);
+        }
+        let highlighted: string;
+        try {
+          highlighted = highlight(code, { language: lang, ignoreIllegals: true, theme: appleTheme });
+        } catch {
+          highlighted = code;
+        }
+        const hLines = highlighted.split("\n");
+        const gutterW = String(hLines.length).length;
+        const numbered = hLines.map((l, i) => {
+          const num = tertiary(String(i + 1).padStart(gutterW));
+          return "  " + num + separator(" │ ") + l;
+        }).join("\n");
+        return "\n" + header + "\n" + numbered + "\n";
       }
       return false; // fall through to markedTerminal
     },
@@ -369,9 +601,47 @@ marked.use({
 });
 
 /**
- * Render markdown to ANSI-styled terminal string.
+ * Close incomplete markdown fences for safe streaming rendering.
+ * Handles: code fences, bold, inline code, incomplete tables.
  */
-export function renderMarkdown(input: string): string {
-  const result = marked.parse(input) as string;
+export function closeIncompleteFences(input: string): string {
+  let result = input;
+
+  // Close unclosed code fences (```...without closing ```)
+  const fenceMatches = result.match(/```/g);
+  if (fenceMatches && fenceMatches.length % 2 !== 0) {
+    result += "\n```";
+  }
+
+  // Close unclosed inline backticks (odd count)
+  const backtickCount = (result.match(/(?<!`)`(?!`)/g) || []).length;
+  if (backtickCount % 2 !== 0) {
+    result += "`";
+  }
+
+  // Close unclosed bold markers (odd pairs of **)
+  const boldMatches = result.match(/\*\*/g);
+  if (boldMatches && boldMatches.length % 2 !== 0) {
+    result += "**";
+  }
+
+  // Close unclosed italic markers (single * not part of **)
+  // Count standalone * (not part of **)
+  const stripped = result.replace(/\*\*/g, "");
+  const italicCount = (stripped.match(/\*/g) || []).length;
+  if (italicCount % 2 !== 0) {
+    result += "*";
+  }
+
+  return result;
+}
+
+/**
+ * Render markdown to ANSI-styled terminal string.
+ * Optionally applies streaming-safe fence closing.
+ */
+export function renderMarkdown(input: string, streaming = false): string {
+  const safe = streaming ? closeIncompleteFences(input) : input;
+  const result = marked.parse(safe) as string;
   return result.replace(/\n+$/, "");
 }

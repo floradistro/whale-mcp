@@ -17,6 +17,7 @@ import {
   executeLocalTool,
   isLocalTool,
 } from "./local-tools.js";
+import { LoopDetector } from "./loop-detector.js";
 import { loadConfig, resolveConfig } from "./config-store.js";
 import { getValidToken, SUPABASE_URL } from "./auth-service.js";
 import {
@@ -30,7 +31,23 @@ import {
   nextTurn,
   createTurnContext,
   logSpan,
+  generateSpanId,
+  getTurnNumber,
 } from "./telemetry.js";
+import {
+  runPreToolHooks,
+  runPostToolHooks,
+  runPromptSubmitHooks,
+} from "./hooks.js";
+import {
+  handleSlashCommand,
+  generateHelpText,
+} from "./slash-commands.js";
+import {
+  AgentEventEmitter,
+  setGlobalEmitter,
+  clearGlobalEmitter,
+} from "./agent-events.js";
 
 // ============================================================================
 // TYPES
@@ -38,11 +55,11 @@ import {
 
 export interface AgentLoopCallbacks {
   onText: (text: string) => void;
-  onToolStart: (name: string) => void;
+  onToolStart: (name: string, input?: Record<string, unknown>) => void;
   onToolResult: (name: string, success: boolean, result: unknown, input?: Record<string, unknown>, durationMs?: number) => void;
   onUsage: (input_tokens: number, output_tokens: number) => void;
   onDone: (finalMessages: Anthropic.MessageParam[]) => void;
-  onError: (error: string) => void;
+  onError: (error: string, partialMessages?: Anthropic.MessageParam[]) => void;
   onAutoCompact?: (beforeMessages: number, afterMessages: number, tokensSaved: number) => void;
 }
 
@@ -52,6 +69,7 @@ export interface AgentLoopOptions {
   callbacks: AgentLoopCallbacks;
   abortSignal?: AbortSignal;
   model?: string;
+  emitter?: AgentEventEmitter; // Event emitter for decoupled UI
 }
 
 // ============================================================================
@@ -331,100 +349,44 @@ export function compressContext(
 // SYSTEM PROMPT
 // ============================================================================
 
-const LOCAL_TOOLS_DESC = `You have access to local tools for working with the user's filesystem, searching, and running commands:
-
-File operations:
-- read_file: Read file contents (supports offset/limit for large files)
-- write_file: Write/create files (creates parent dirs)
-- edit_file: Make targeted edits via find-and-replace (supports replace_all)
-- list_directory: List files and folders
-
-Search tools:
-- glob: Fast file pattern matching (e.g. "**/*.ts", "src/**/*.tsx")
-- grep: Search file contents with regex, context lines, output modes (content/files/count)
-- search_files: Find files by name pattern (simple, use glob for advanced)
-- search_content: Search file contents (simple, use grep for advanced)
-
-Shell:
-- run_command: Execute shell commands with configurable timeout
-
-Web:
-- web_fetch: Fetch URL content as cleaned markdown text
-
-Notebooks:
-- notebook_edit: Edit Jupyter notebook cells (replace, insert, delete)
-
-Task tracking:
-- todo_write: Manage a session todo list with status tracking`;
-
-const SERVER_TOOLS_DESC = `You also have server tools for managing the business:
-- inventory: Adjust, set, transfer stock (actions: adjust, set, transfer, bulk_adjust, bulk_set, bulk_clear)
-- inventory_query: Query stock levels (actions: summary, velocity, by_location, in_stock)
-- inventory_audit: Audit workflow (actions: start, count, complete, summary)
-- purchase_orders: Manage POs (actions: create, list, get, add_items, approve, receive, cancel)
-- transfers: Transfer between locations (actions: create, list, get, receive, cancel)
-- products: Find/create/update products (actions: find, create, update, pricing_templates)
-- collections: Manage collections (actions: find, create, get_theme, set_theme, set_icon)
-- customers: Manage customers (actions: find, create, update)
-- analytics: Sales analytics (actions: summary, by_location, detailed, discover, employee)
-- orders: Find/get orders (actions: find, get)
-- locations: List store locations
-- suppliers: Find suppliers
-- email: Send/manage email (actions: send, send_template, list, get, templates, inbox, inbox_get, inbox_reply, inbox_update, inbox_stats)
-- documents: Generate documents (COAs)
-- web_search: Search the web via Exa AI (neural, keyword, or auto search with domain filtering)
-- alerts: System alerts (low stock, pending orders)
-- audit_trail: View audit logs
-
-Server tools use an "action" parameter to select the operation.`;
-
 function buildSystemPrompt(hasServerTools: boolean): string {
-  let prompt = `You are whale code, a CLI AI assistant similar to Claude Code.\n\n${LOCAL_TOOLS_DESC}`;
+  let prompt = `You are whale code, a CLI AI assistant.
+
+## Working Directory
+${process.cwd()}
+
+## Tool Use
+- Call multiple independent tools in ONE response (parallel execution)
+- Only chain across turns when a result is needed for the next call
+- If a tool fails 3 times, try a different approach`;
+
   if (hasServerTools) {
-    prompt += `\n\n${SERVER_TOOLS_DESC}`;
+    prompt += `\n- Use audit_trail for store activity, telemetry for AI system metrics`;
   }
 
-  // Load CLAUDE.md project instructions
   const claudeMd = loadClaudeMd();
   if (claudeMd) {
     prompt += `\n\n## Project Instructions (from ${claudeMd.path})\n\n${claudeMd.content}`;
   }
 
-  prompt += `\n\nBe concise and direct. When the user asks you to do something, use the tools to do it — don't just explain how. Show relevant output but keep responses short.
-
-## Formatting Rules — ALWAYS follow these for rich terminal output
+  prompt += `\n\n## Formatting Rules
 
 ### Bar Charts
-When presenting comparative data (revenue by category, sales by location, top products, monthly trends, etc.), ALWAYS use a \`\`\`chart code block:
-
+Use \`\`\`chart code blocks for comparative data:
 \`\`\`chart
-Monthly Revenue
-Jan: $45,200
-Feb: $52,100
-Mar: $61,300
+Title
+Label: $value
 \`\`\`
 
-The first line is an optional title. Each data line is "Label: value". Values can be $dollars, percentages%, or plain numbers.
-
 ### Tables
-When presenting structured data with multiple columns, ALWAYS use markdown tables:
-
-| Product | Revenue | Units | Margin |
-|---------|---------|-------|--------|
-| Widget A | $12,500 | 340 | 42% |
-| Widget B | $8,200 | 210 | 38% |
-
-### Financial Data
-- ALWAYS present financial summaries using charts and tables — NEVER use plain text trees or bullet points for financial data
-- Use \`\`\`chart blocks for any comparison (revenue breakdown, category sales, location performance)
-- Use markdown tables for detailed line-item data
-- Include dollar signs ($) on all monetary values so they render in green
-- Include percent signs (%) on all percentage values so they render in cyan
+Use markdown tables for multi-column data.
 
 ### Style
-- NEVER use emojis (💰📊🛒 etc.) — this terminal uses JetBrains Mono which renders emojis as broken double-width glyphs
-- Use plain text labels instead of emojis (e.g. "Revenue:" not "💰 Revenue:")
-- Keep output clean and monospace-aligned`;
+- NEVER use emojis — terminal renders them as broken glyphs
+- Include $ on monetary values, % on percentages
+- Keep output clean and monospace-aligned
+
+Be concise. Use tools to do work — don't just explain.`;
 
   return prompt;
 }
@@ -590,7 +552,8 @@ interface StreamResult {
 async function processStreamEvents(
   events: AsyncGenerator<any>,
   callbacks: AgentLoopCallbacks,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  emitter?: AgentEventEmitter
 ): Promise<StreamResult> {
   let text = "";
   const toolUseBlocks: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
@@ -608,13 +571,19 @@ async function processStreamEvents(
         if (event.content_block?.type === "tool_use") {
           currentToolUse = { id: event.content_block.id, name: event.content_block.name, input: "" };
           callbacks.onToolStart(event.content_block.name);
+          emitter?.emitToolStart(event.content_block.id, event.content_block.name);
         }
         break;
 
       case "content_block_delta":
         if (event.delta?.type === "text_delta") {
           text += event.delta.text;
-          callbacks.onText(event.delta.text);
+          // Use emitter for batched text if available
+          if (emitter) {
+            emitter.emitText(event.delta.text);
+          } else {
+            callbacks.onText(event.delta.text);
+          }
         } else if (event.delta?.type === "input_json_delta" && currentToolUse) {
           currentToolUse.input += event.delta.partial_json;
         }
@@ -623,11 +592,14 @@ async function processStreamEvents(
       case "content_block_stop":
         if (currentToolUse) {
           try {
+            const parsed = JSON.parse(currentToolUse.input || "{}");
             toolUseBlocks.push({
               id: currentToolUse.id,
               name: currentToolUse.name,
-              input: JSON.parse(currentToolUse.input || "{}"),
+              input: parsed,
             });
+            // Update running tool with parsed input so UI can show context
+            callbacks.onToolStart(currentToolUse.name, parsed);
           } catch { /* skip bad JSON */ }
           currentToolUse = null;
         }
@@ -636,7 +608,6 @@ async function processStreamEvents(
       case "message_start":
         if (event.message?.usage) {
           totalIn += event.message.usage.input_tokens;
-          // Track prompt caching metrics
           cacheCreationTokens += event.message.usage.cache_creation_input_tokens || 0;
           cacheReadTokens += event.message.usage.cache_read_input_tokens || 0;
         }
@@ -645,13 +616,27 @@ async function processStreamEvents(
       case "message_delta":
         if (event.usage) totalOut += event.usage.output_tokens;
         break;
+
+      case "error": {
+        // Proxy sends {"type":"error","error":"..."} for upstream API errors
+        const errMsg = typeof event.error === "string" ? event.error : JSON.stringify(event.error);
+        throw new Error(errMsg);
+      }
     }
   }
 
-  // Update session-wide token tracking and context size awareness
+  // Flush any remaining buffered text
+  emitter?.flushText();
+
+  // Update session-wide token tracking
   sessionInputTokens += totalIn;
   sessionOutputTokens += totalOut;
-  lastKnownInputTokens = totalIn; // Track for auto-compact decisions
+  lastKnownInputTokens = totalIn;
+
+  // Emit usage via emitter
+  if (emitter && (totalIn > 0 || totalOut > 0)) {
+    emitter.emitUsage(totalIn, totalOut);
+  }
 
   return { text, toolUseBlocks, totalIn, totalOut, cacheCreationTokens, cacheReadTokens };
 }
@@ -722,8 +707,13 @@ async function getEventStream(
 // ============================================================================
 
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
-  const { message, conversationHistory, callbacks, abortSignal } = opts;
+  const { message, conversationHistory, callbacks, abortSignal, emitter } = opts;
   if (opts.model) setModel(opts.model);
+
+  // Set global emitter for subagents to use
+  if (emitter) {
+    setGlobalEmitter(emitter);
+  }
 
   const { tools, serverToolCount } = await getTools();
   const systemPrompt = buildSystemPrompt(serverToolCount > 0);
@@ -731,11 +721,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   // Apply context compression before starting — notify user if it fires
   const compressedHistory = compressContext(conversationHistory, (before, after, saved) => {
     callbacks.onAutoCompact?.(before, after, saved);
+    emitter?.emitCompact(before, after, saved);
   });
   const messages: Anthropic.MessageParam[] = [
     ...compressedHistory,
     { role: "user", content: message },
   ];
+
+  const loopDetector = new LoopDetector();
 
   let totalIn = 0;
   let totalOut = 0;
@@ -743,14 +736,16 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   let totalCacheRead = 0;
   let allAssistantText: string[] = [];
 
-  // Telemetry: log user message at conversation start
+  // Telemetry: one turn per user message (not per API call)
   const sessionStart = Date.now();
   const { storeId } = resolveConfig();
-  const initialTurnCtx = createTurnContext({ model: activeModel, turnNumber: 1 });
+  const turnNum = nextTurn(); // ONCE per user message
+  const turnCtx = createTurnContext({ model: activeModel, turnNumber: turnNum });
+
   logSpan({
     action: "chat.user_message",
     durationMs: 0,
-    context: initialTurnCtx,
+    context: turnCtx,
     storeId: storeId || undefined,
     details: {
       message: message,
@@ -759,36 +754,64 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   });
 
   try {
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      if (abortSignal?.aborted) { callbacks.onError("Cancelled"); return; }
+    for (let iteration = 0; iteration < MAX_TURNS; iteration++) {
+      if (abortSignal?.aborted) { callbacks.onError("Cancelled", messages); return; }
 
       // Mid-loop auto-compact: if context grew large during tool use, compress before next API call
-      if (turn > 0 && needsCompaction(messages)) {
-        const beforeLen = messages.length;
+      if (iteration > 0 && needsCompaction(messages)) {
+        const compactStart = Date.now();
+        const beforeCount = messages.length;
         const compressed = compressContext(messages, (before, after, saved) => {
           callbacks.onAutoCompact?.(before, after, saved);
+          emitter?.emitCompact(before, after, saved);
+
+          logSpan({
+            action: "chat.context_compaction",
+            durationMs: Date.now() - compactStart,
+            context: turnCtx,
+            storeId: storeId || undefined,
+            details: {
+              messages_before: before,
+              messages_after: after,
+              tokens_saved: saved,
+              iteration,
+            },
+          });
         });
-        // Replace messages array content in-place
         messages.length = 0;
         messages.push(...compressed);
       }
 
-      // Telemetry: start a new turn
-      const turnNum = nextTurn();
-      const turnCtx = createTurnContext({ model: activeModel, turnNumber: turnNum });
       const apiStart = Date.now();
+      const apiSpanId = generateSpanId(); // Unique span ID for this API call — tools reference as parent
 
       // Get streaming events with retry logic
       let result: StreamResult | null = null;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
           const events = await getEventStream(messages, tools, systemPrompt, abortSignal);
-          result = await processStreamEvents(events, callbacks, abortSignal);
+          result = await processStreamEvents(events, callbacks, abortSignal, emitter);
           break; // Success
         } catch (err: any) {
           if (abortSignal?.aborted) throw err;
           if (attempt < MAX_RETRIES && isRetryableError(err)) {
             const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+
+            logSpan({
+              action: "claude_api_retry",
+              durationMs: delay,
+              context: { ...turnCtx, spanId: apiSpanId },
+              storeId: storeId || undefined,
+              error: String(err?.message || err),
+              details: {
+                attempt: attempt + 1,
+                max_attempts: MAX_RETRIES,
+                delay_ms: delay,
+                error_type: classifyToolError(String(err?.message || err)),
+                iteration,
+              },
+            });
+
             await sleep(delay);
             continue;
           }
@@ -808,30 +831,70 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         allAssistantText.push(result.text);
       }
 
-      // Telemetry: log API call span
+      // Telemetry: log API call span (gen_ai.* OTEL convention matches UI)
       logSpan({
         action: "claude_api_request",
         durationMs: Date.now() - apiStart,
         context: {
           ...turnCtx,
+          spanId: apiSpanId,
           inputTokens: result.totalIn,
           outputTokens: result.totalOut,
         },
         storeId: storeId || undefined,
         details: {
-          cache_creation_tokens: result.cacheCreationTokens,
-          cache_read_tokens: result.cacheReadTokens,
+          "gen_ai.request.model": activeModel,
+          "gen_ai.usage.input_tokens": result.totalIn,
+          "gen_ai.usage.output_tokens": result.totalOut,
+          "gen_ai.usage.cache_creation_tokens": result.cacheCreationTokens,
+          "gen_ai.usage.cache_read_tokens": result.cacheReadTokens,
+          stop_reason: result.toolUseBlocks.length > 0 ? "tool_use" : "end_turn",
+          iteration,
+          tool_count: result.toolUseBlocks.length,
+          tool_names: result.toolUseBlocks.map(t => t.name),
         },
       });
 
       // No tool calls — we're done
       if (result.toolUseBlocks.length === 0) break;
 
-      // Execute tools (local + server)
+      // Execute tools — all in parallel (up to MAX_CONCURRENT_TASKS at a time)
+      const MAX_CONCURRENT_TASKS = 7;
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      const toolResultMap = new Map<string, Anthropic.ToolResultBlockParam>();
 
-      for (const tu of result.toolUseBlocks) {
-        if (abortSignal?.aborted) { callbacks.onError("Cancelled"); return; }
+      // Helper to execute a single tool and build its result
+      async function executeSingleTool(tu: { id: string; name: string; input: Record<string, unknown> }): Promise<void> {
+        if (abortSignal?.aborted) return;
+
+        // Circuit breaker check
+        const loopCheck = loopDetector.recordCall(tu.name, tu.input);
+        if (loopCheck.blocked) {
+          const blockedResult = { success: false, output: loopCheck.reason! };
+
+          logSpan({
+            action: "tool.circuit_breaker",
+            durationMs: 0,
+            context: { ...turnCtx, parentSpanId: apiSpanId },
+            storeId: storeId || undefined,
+            severity: "warn",
+            error: loopCheck.reason,
+            details: {
+              tool_name: tu.name,
+              tool_input: tu.input,
+              iteration,
+            },
+          });
+
+          callbacks.onToolResult(tu.name, false, blockedResult.output, tu.input, 0);
+          emitter?.emitToolEnd(tu.id, tu.name, false, blockedResult.output, tu.input, 0);
+          toolResultMap.set(tu.id, {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: JSON.stringify({ error: blockedResult.output }),
+          });
+          return;
+        }
 
         const toolStart = Date.now();
         let toolResult: { success: boolean; output: string };
@@ -839,33 +902,94 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         if (isLocalTool(tu.name)) {
           toolResult = await executeLocalTool(tu.name, tu.input);
 
-          // Telemetry: log local tool span
           logSpan({
             action: `tool.${tu.name}`,
             durationMs: Date.now() - toolStart,
-            context: { ...turnCtx, spanId: undefined },
+            context: { ...turnCtx, parentSpanId: apiSpanId },
             storeId: storeId || undefined,
             error: toolResult.success ? undefined : String(toolResult.output),
-            details: { tool_type: "local", tool_input: tu.input },
+            details: {
+              tool_type: "local",
+              tool_input: tu.input,
+              tool_result: truncateResult(toolResult.output, 2000),
+              description: (tu.input.description || tu.input.command || tu.input.path || undefined) as string | undefined,
+              error_type: toolResult.success ? undefined : classifyToolError(toolResult.output),
+              iteration,
+            },
           });
         } else if (isServerTool(tu.name)) {
-          // Server tool — executeTool() handles its own telemetry
           toolResult = await executeServerTool(tu.name, tu.input, {
             ...turnCtx,
-            spanId: undefined, // let executor generate its own
+            spanId: undefined,
+          });
+
+          logSpan({
+            action: `tool.${tu.name}`,
+            durationMs: Date.now() - toolStart,
+            context: { ...turnCtx, parentSpanId: apiSpanId },
+            storeId: storeId || undefined,
+            error: toolResult.success ? undefined : String(toolResult.output),
+            details: {
+              tool_type: "server",
+              tool_input: tu.input,
+              tool_result: truncateResult(toolResult.output, 2000),
+              error_type: toolResult.success ? undefined : classifyToolError(toolResult.output),
+              iteration,
+            },
           });
         } else {
           toolResult = { success: false, output: `Unknown tool: ${tu.name}` };
         }
 
         const toolDurationMs = Date.now() - toolStart;
+        loopDetector.recordResult(tu.name, toolResult.success);
         callbacks.onToolResult(tu.name, toolResult.success, toolResult.output, tu.input, toolDurationMs);
+        emitter?.emitToolEnd(tu.id, tu.name, toolResult.success, toolResult.output, tu.input, toolDurationMs);
 
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: tu.id,
-          content: JSON.stringify(toolResult.success ? toolResult.output : { error: toolResult.output }),
-        });
+        // Check for image marker — convert to image content block
+        const imageMatch = toolResult.success && typeof toolResult.output === "string"
+          ? toolResult.output.match(/^__IMAGE__(.+?)__(.+)$/)
+          : null;
+
+        let resultBlock: Anthropic.ToolResultBlockParam;
+        if (imageMatch) {
+          resultBlock = {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: [
+              {
+                type: "image" as any,
+                source: {
+                  type: "base64",
+                  media_type: imageMatch[1],
+                  data: imageMatch[2],
+                },
+              } as any,
+            ],
+          };
+        } else {
+          resultBlock = {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: JSON.stringify(toolResult.success ? toolResult.output : { error: toolResult.output }),
+          };
+        }
+        toolResultMap.set(tu.id, resultBlock);
+      }
+
+      // Execute all tools in parallel (up to MAX_CONCURRENT_TASKS)
+      // All tool calls in a single model response are independent (model can't see intermediate results)
+      const allBlocks = result.toolUseBlocks;
+      for (let i = 0; i < allBlocks.length; i += MAX_CONCURRENT_TASKS) {
+        if (abortSignal?.aborted) { callbacks.onError("Cancelled", messages); return; }
+        const batch = allBlocks.slice(i, i + MAX_CONCURRENT_TASKS);
+        await Promise.all(batch.map(tu => executeSingleTool(tu)));
+      }
+
+      // Collect results in original order
+      for (const tu of result.toolUseBlocks) {
+        const r = toolResultMap.get(tu.id);
+        if (r) toolResults.push(r);
       }
 
       // Append assistant response + tool results for next turn
@@ -891,7 +1015,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         action: "chat.assistant_response",
         durationMs: Date.now() - sessionStart,
         context: {
-          ...initialTurnCtx,
+          ...turnCtx,
           inputTokens: totalIn,
           outputTokens: totalOut,
           model: activeModel,
@@ -912,7 +1036,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       action: "chat.session_complete",
       durationMs: Date.now() - sessionStart,
       context: {
-        ...initialTurnCtx,
+        ...turnCtx,
         inputTokens: totalIn,
         outputTokens: totalOut,
         model: activeModel,
@@ -927,19 +1051,52 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         session_input_tokens: sessionInputTokens,
         session_output_tokens: sessionOutputTokens,
         model: activeModel,
-        turns: nextTurn(),
       },
     });
 
     callbacks.onUsage(totalIn, totalOut);
+
+    // Emit done event and clean up
+    // Send only the LAST turn's text (earlier turns were displayed alongside their tools)
+    const finalText = allAssistantText.length > 0
+      ? allAssistantText[allAssistantText.length - 1]
+      : "";
+    emitter?.emitDone(finalText, messages);
+    if (emitter) clearGlobalEmitter();
+
     callbacks.onDone(messages);
   } catch (err: any) {
-    if (abortSignal?.aborted || err?.message === "Cancelled") {
-      callbacks.onError("Cancelled");
-    } else {
-      callbacks.onError(String(err?.message || err));
-    }
+    const errorMsg = abortSignal?.aborted || err?.message === "Cancelled"
+      ? "Cancelled"
+      : String(err?.message || err);
+
+    // Emit error event and clean up
+    emitter?.emitError(errorMsg);
+    if (emitter) clearGlobalEmitter();
+
+    callbacks.onError(errorMsg, messages);
   }
+}
+
+// ============================================================================
+// TELEMETRY HELPERS
+// ============================================================================
+
+export function truncateResult(output: string, maxLen: number): string {
+  if (output.length <= maxLen) return output;
+  return output.slice(0, maxLen) + `... (${output.length} chars total)`;
+}
+
+export function classifyToolError(output: string): string {
+  const lower = output.toLowerCase();
+  if (lower.includes("timed out") || lower.includes("timeout")) return "timeout";
+  if (lower.includes("permission denied") || lower.includes("eacces")) return "permission";
+  if (lower.includes("not found") || lower.includes("no such file")) return "not_found";
+  if (lower.includes("command not found") || lower.includes("exit code 127")) return "command_not_found";
+  if (lower.includes("import") && lower.includes("error")) return "import_error";
+  if (lower.includes("syntax") || lower.includes("parse")) return "syntax_error";
+  if (lower.includes("externally-managed")) return "env_managed";
+  return "unknown";
 }
 
 // Convenience: check if user can use the agent (logged in OR has API key)
@@ -951,3 +1108,21 @@ export function canUseAgent(): { ready: boolean; reason?: string } {
   if (hasToken || hasApiKey) return { ready: true };
   return { ready: false, reason: "Run `whale login` to authenticate." };
 }
+
+// Re-export slash command utilities for ChatApp
+export { handleSlashCommand, generateHelpText } from "./slash-commands.js";
+
+// Re-export interactive tools for UI handling
+export {
+  interactiveEvents,
+  getPendingQuestion,
+  resolveQuestion,
+  isPlanMode,
+  getPlanModeState,
+} from "./interactive-tools.js";
+
+// Re-export background process listing for /tasks command
+export { listProcesses } from "./background-processes.js";
+
+// Re-export event emitter for ChatApp
+export { AgentEventEmitter, type AgentEvent } from "./agent-events.js";

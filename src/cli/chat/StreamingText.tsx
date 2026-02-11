@@ -1,39 +1,17 @@
 /**
- * StreamingText — smooth cursor animation while streaming
+ * StreamingText — renders streaming markdown text
  *
- * Thin blinking line cursor (like macOS text fields),
- * not the heavy block cursor.
+ * Wrapped in React.memo to prevent re-renders when parent state
+ * (subagent updates, tool updates) changes but text hasn't.
  */
 
-import React, { useState, useEffect } from "react";
-import { Box, Text } from "ink";
-import { colors } from "../shared/Theme.js";
+import React from "react";
 import { MarkdownText } from "./MarkdownText.js";
 
 interface StreamingTextProps {
   text: string;
-  isStreaming: boolean;
 }
 
-export function StreamingText({ text, isStreaming }: StreamingTextProps) {
-  const [cursorPhase, setCursorPhase] = useState(0);
-
-  useEffect(() => {
-    if (!isStreaming) return;
-    const timer = setInterval(() => setCursorPhase((p) => (p + 1) % 4), 200);
-    return () => clearInterval(timer);
-  }, [isStreaming]);
-
-  // Smooth fade cursor: ▎ → ▏ → (space) → ▏ → ▎
-  const cursorChars = ["▍", "▎", "▏", " "];
-  const cursor = cursorChars[cursorPhase];
-
-  return (
-    <Box flexDirection="column">
-      <MarkdownText text={text} streaming={isStreaming} />
-      {isStreaming && (
-        <Text color={colors.brand}>{cursor}</Text>
-      )}
-    </Box>
-  );
-}
+export const StreamingText = React.memo(function StreamingText({ text }: StreamingTextProps) {
+  return <MarkdownText text={text} />;
+});
