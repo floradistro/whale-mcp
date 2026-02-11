@@ -28,6 +28,10 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/store",    description: "Switch active store" },
   { name: "/status",   description: "Show session info" },
   { name: "/agents",   description: "List available agent types" },
+  { name: "/remember", description: "Remember a fact across sessions" },
+  { name: "/forget",   description: "Forget a remembered fact" },
+  { name: "/memory",   description: "List all remembered facts" },
+  { name: "/mode",     description: "Permission mode (default/plan/yolo)" },
   { name: "/update",   description: "Check for updates & install" },
   { name: "/clear",    description: "Clear conversation" },
   { name: "/exit",     description: "Exit" },
@@ -74,6 +78,14 @@ export function ChatInput({ onSubmit, onCommand, disabled, agentName }: ChatInpu
   const handleSubmit = (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || disabled) return;
+
+    // Intercept typed slash commands (e.g. "/remember something")
+    if (trimmed.startsWith("/")) {
+      setValue("");
+      onCommand(trimmed);
+      return;
+    }
+
     onSubmit(trimmed);
     setValue("");
   };

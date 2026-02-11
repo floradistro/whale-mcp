@@ -417,6 +417,9 @@ async function processStream(body: ReadableStream<Uint8Array>): Promise<{
         try { event = JSON.parse(data); } catch { continue; }
 
         switch (event.type) {
+          case "error":
+            // Proxy wraps API errors as SSE error events — throw so caller can handle
+            throw new Error(event.error || "Unknown streaming error from proxy");
           case "message_start":
             inputTokens = event.message?.usage?.input_tokens || 0;
             break;
@@ -521,7 +524,10 @@ async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
     serverTools = await loadServerToolDefinitions();
   } catch {}
 
-  const allTools = [...localTools, ...serverTools, ...TEAM_TOOLS];
+  // Deduplicate: local tools take priority over server tools with the same name
+  const localNames = new Set(localTools.map(t => t.name));
+  const uniqueServerTools = serverTools.filter(t => !localNames.has(t.name));
+  const allTools = [...localTools, ...uniqueServerTools, ...TEAM_TOOLS];
 
   const loopDetector = new LoopDetector();
 
@@ -628,9 +634,43 @@ async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
 
     // Agent loop for current task
     let taskExhausted = false;
+    let apiError: string | null = null;
     for (let turn = 0; turn < MAX_TURNS_PER_TASK; turn++) {
       const apiStart = Date.now();
-      const response = await callAPI(modelId, systemPrompt, messages, allTools);
+      let response: Awaited<ReturnType<typeof callAPI>>;
+      try {
+        response = await callAPI(modelId, systemPrompt, messages, allTools);
+      } catch (err: any) {
+        apiError = err.message || String(err);
+        report({ type: "progress", teammateId, content: `API error: ${apiError!.slice(0, 80)}` });
+        logSpan({
+          action: "claude_api_request",
+          durationMs: Date.now() - apiStart,
+          severity: "error",
+          error: apiError || undefined,
+          context: {
+            traceId: teammateTraceId,
+            spanId: generateSpanId(),
+            parentSpanId: teammateSpanId,
+            conversationId: teammateConversationId,
+            source: "claude_code",
+            serviceName: "whale-cli",
+            serviceVersion: "2.1.0",
+            model: modelId,
+          },
+          details: {
+            is_team: true,
+            is_teammate: true,
+            team_id: teamId,
+            teammate_id: teammateId,
+            teammate_name: teammateName,
+            parent_conversation_id: parentConversationId,
+            turn_number: turn + 1,
+            task_id: currentTaskId,
+          },
+        });
+        break; // Exit inner loop — force-complete handler below will deal with the task
+      }
       const apiDuration = Date.now() - apiStart;
       totalIn += response.usage.input_tokens;
       totalOut += response.usage.output_tokens;
@@ -803,26 +843,36 @@ async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
       }
     }
 
-    // If inner loop ended without completing the task (exhausted turns or no-tool response),
-    // force-complete it to prevent infinite outer loop
+    // If inner loop ended without completing the task (exhausted turns, API error, or no-tool response)
     if (currentTaskId) {
       const team = loadTeam(teamId);
       const task = team?.tasks.find(t => t.id === currentTaskId);
       if (task && task.status === "in_progress") {
-        // Gather whatever text the model produced as the result
-        const lastText = messages.length > 0 ? messages[messages.length - 1] : null;
-        let partialResult = "Task auto-completed after reaching turn limit.";
-        if (lastText && typeof lastText === "object" && "content" in lastText) {
-          const content = lastText.content;
-          if (typeof content === "string") partialResult = content.slice(0, 500);
-          else if (Array.isArray(content)) {
-            const txt = content.find((b: any) => b.type === "text");
-            if (txt && "text" in txt) partialResult = (txt as any).text.slice(0, 500);
+        if (apiError) {
+          // API failed — mark task as failed, not completed
+          await failTask(teamId, currentTaskId, apiError);
+          // Report as progress (not error) — error type causes red flash in UI via handleTeammateFailure double-handling
+          report({ type: "progress", teammateId, taskId: currentTaskId, content: `Task failed: ${apiError.slice(0, 80)}` });
+        } else if (totalIn === 0 && totalOut === 0) {
+          // Zero tokens used means no real work was done — fail the task
+          await failTask(teamId, currentTaskId, "No API response received (0 tokens)");
+          report({ type: "progress", teammateId, taskId: currentTaskId, content: "Task failed: no API response" });
+        } else {
+          // Exhausted turns or model stopped — auto-complete with partial result
+          const lastText = messages.length > 0 ? messages[messages.length - 1] : null;
+          let partialResult = "Task auto-completed after reaching turn limit.";
+          if (lastText && typeof lastText === "object" && "content" in lastText) {
+            const content = lastText.content;
+            if (typeof content === "string") partialResult = content.slice(0, 500);
+            else if (Array.isArray(content)) {
+              const txt = content.find((b: any) => b.type === "text");
+              if (txt && "text" in txt) partialResult = (txt as any).text.slice(0, 500);
+            }
           }
+          await completeTask(teamId, currentTaskId, partialResult);
+          tasksCompleted++;
+          report({ type: "task_completed", teammateId, taskId: currentTaskId, content: partialResult });
         }
-        await completeTask(teamId, currentTaskId, partialResult);
-        tasksCompleted++;
-        report({ type: "task_completed", teammateId, taskId: currentTaskId, content: partialResult });
       }
       currentTaskId = null;
       await updateTeammate(teamId, teammateId, { status: "idle", currentTask: undefined });

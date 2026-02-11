@@ -121,10 +121,8 @@ const appleTheme = {
 
 function colorizeFinancials(str: string): string {
   return str
-    // URLs → OSC 8 clickable hyperlinks (cyan underline)
-    .replace(/(https?:\/\/[^\s,)]+)/g, (m) => hyperlink(m))
-    // localhost with port → clickable hyperlink (auto-prefix http://)
-    .replace(/(localhost:\d+[^\s,)]*)/g, (m) => hyperlink(`http://${m}`, m))
+    // NOTE: URL hyperlinking is handled by marked's GFM autolink + link/href handlers.
+    // Do NOT add URL patterns here — it causes links to render 3-5x.
     // Negative dollar amounts → red  (-$1,234.56)
     .replace(/(-\$[\d,]+\.?\d*)/g, (m) => systemRed(m))
     // Positive dollar amounts → green  ($1,234.56)
@@ -162,9 +160,9 @@ marked.use(
       paragraph: (body: string) => colorizeFinancials(body),
       hr: () => separator("─".repeat(50)),
 
-      // Links — OSC 8 clickable
-      link: (href: string) => hyperlink(href),
-      href: (href: string) => hyperlink(href),
+      // Links — OSC 8 clickable (single source of truth for URL rendering)
+      // NOTE: Only use `link` handler, NOT `href` — having both causes double-hyperlinking
+      link: (href: string, _title: string, text: string) => hyperlink(href, text !== href ? text : undefined),
 
       // Lists — purple bullets, financial-aware
       list: (body: string, ordered: boolean) => {
@@ -569,19 +567,33 @@ marked.use({
       if (lang === "diff") {
         return renderDiff(code);
       }
-      if (lang) {
+      {
         // Build header: ── lang ── subtitle ──────
         let header: string;
-        if (subtitle) {
+        if (lang && subtitle) {
           const pad = Math.max(2, 44 - lang.length - subtitle.length);
           header = separator("  ── ") + tertiary(lang) + separator(" ── ") + secondary(subtitle) + separator(` ${"─".repeat(pad)}`);
-        } else {
+        } else if (lang) {
           header = separator("  ── ") + tertiary(lang) + separator(` ${"─".repeat(Math.max(2, 46 - lang.length))}`);
+        } else {
+          // No lang — minimal header
+          header = separator("  ── ") + separator("─".repeat(46));
         }
         let highlighted: string;
-        try {
-          highlighted = highlight(code, { language: lang, ignoreIllegals: true, theme: appleTheme });
-        } catch {
+        if (lang) {
+          try {
+            // Suppress cli-highlight warnings (e.g. "Could not find the language")
+            const origWarn = console.warn;
+            console.warn = () => {};
+            try {
+              highlighted = highlight(code, { language: lang, ignoreIllegals: true, theme: appleTheme });
+            } finally {
+              console.warn = origWarn;
+            }
+          } catch {
+            highlighted = code;
+          }
+        } else {
           highlighted = code;
         }
         const hLines = highlighted.split("\n");
@@ -592,7 +604,6 @@ marked.use({
         }).join("\n");
         return "\n" + header + "\n" + numbered + "\n";
       }
-      return false; // fall through to markedTerminal
     },
     table(this: any, token: any) {
       return renderTable(token);

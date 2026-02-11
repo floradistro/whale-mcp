@@ -1,12 +1,14 @@
 /**
  * ChatApp — whale code CLI
  *
- * Simple: render all messages, streaming section, input.
- * No height budgets, no Static, no fixed heights.
+ * Uses Ink's <Static> for completed messages — written to stdout once,
+ * never re-rendered. Only the active area (streaming, tools, input)
+ * is managed by Ink's render loop. This prevents scroll bounce when
+ * content exceeds the terminal height.
  */
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { Box, Text, Static, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import { execSync } from "child_process";
 import Anthropic from "@anthropic-ai/sdk";
@@ -15,6 +17,8 @@ import {
   setModel, getModel, getModelShortName,
   loadClaudeMd, compressContext, getSessionTokens,
   saveSession, loadSession, listSessions, type SessionMeta,
+  addMemory, removeMemory, listMemories,
+  setPermissionMode, getPermissionMode, type PermissionMode,
 } from "../services/agent-loop.js";
 import { getAllServerToolDefinitions, resetServerToolClient } from "../services/server-tools.js";
 import { LOCAL_TOOL_DEFINITIONS, loadTodos, setTodoSessionId } from "../services/local-tools.js";
@@ -57,6 +61,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PKG_VERSION: string = createRequire(import.meta.url)(join(__dirname, "..", "..", "..", "package.json")).version;
 
+// ── Types for Static rendering ──
+
+type StaticItem =
+  | { id: string; type: "header" }
+  | { id: string; type: "message"; msg: ChatMessage; index: number };
+
 // ── Component ──
 
 export function ChatApp() {
@@ -92,9 +102,16 @@ export function ChatApp() {
   const abortRef = useRef<AbortController | null>(null);
   const accTextRef = useRef(""); // Accumulates streaming text, flushed to state every 150ms
   const textTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const teamTimerRef = useRef<NodeJS.Timeout | null>(null); // Debounce team state updates
+  const toolOutputTimerRef = useRef<NodeJS.Timeout | null>(null); // Throttle tool_output re-renders
+  const thinkingVerbRef = useRef(randomVerb()); // Stable verb — doesn't change every render
 
   useEffect(() => {
-    return () => { if (textTimerRef.current) clearTimeout(textTimerRef.current); };
+    return () => {
+      if (textTimerRef.current) clearTimeout(textTimerRef.current);
+      if (teamTimerRef.current) clearTimeout(teamTimerRef.current);
+      if (toolOutputTimerRef.current) clearTimeout(toolOutputTimerRef.current);
+    };
   }, []);
 
   // ── Init ──
@@ -126,7 +143,12 @@ export function ChatApp() {
 
   // ── Commands ──
   const handleCommand = useCallback(async (command: string) => {
-    switch (command) {
+    // Parse typed commands with args (e.g. "/remember always use bun")
+    const parts = command.trim().split(/\s+/);
+    const cmd = parts[0]; // e.g. "/remember"
+    const args = parts.slice(1).join(" "); // e.g. "always use bun"
+
+    switch (cmd) {
       case "/help":
         setMessages((prev) => [...prev, {
           role: "assistant",
@@ -170,6 +192,7 @@ export function ChatApp() {
           tokenLine,
           `  session   ${sessionId || "(unsaved)"}`,
           `  CLAUDE.md ${claudeMd ? claudeMd.path : "not found"}`,
+          `  mode      ${getPermissionMode()}`,
           `  context   ${conversationRef.current.length} messages`,
           `  expand    ${toolsExpanded ? "on" : "off"}  (^E)`,
         ];
@@ -243,15 +266,26 @@ export function ChatApp() {
 
       case "/model": {
         const models = ["sonnet", "opus", "haiku"];
-        const current = getModelShortName();
-        const nextIdx = (models.indexOf(current) + 1) % models.length;
-        const next = models[nextIdx];
-        const result = setModel(next);
-        setCurrentModel(next);
-        setMessages((prev) => [...prev, {
-          role: "assistant",
-          text: `  ${symbols.check} Model: ${next}  (${result.model})`,
-        }]);
+        if (args && models.includes(args)) {
+          // Explicit: /model opus
+          const result = setModel(args);
+          setCurrentModel(args);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Model: ${args}  (${result.model})`,
+          }]);
+        } else {
+          // Cycle through models
+          const current = getModelShortName();
+          const nextIdx = (models.indexOf(current) + 1) % models.length;
+          const next = models[nextIdx];
+          const result = setModel(next);
+          setCurrentModel(next);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Model: ${next}  (${result.model})`,
+          }]);
+        }
         break;
       }
 
@@ -345,6 +379,75 @@ export function ChatApp() {
         break;
       }
 
+      case "/remember": {
+        if (!args) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  Usage: /remember <fact to remember>" }]);
+        } else {
+          const result = addMemory(args);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${result.success ? symbols.check : symbols.cross} ${result.message}`,
+          }]);
+        }
+        break;
+      }
+
+      case "/forget": {
+        if (!args) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  Usage: /forget <pattern to match>" }]);
+        } else {
+          const result = removeMemory(args);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${result.success ? symbols.check : symbols.cross} ${result.message}`,
+          }]);
+        }
+        break;
+      }
+
+      case "/memory": {
+        const memories = listMemories();
+        if (memories.length === 0) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "  No memories stored. Use /remember <fact> to add one." }]);
+        } else {
+          const lines = memories.map((m, i) => `  ${i + 1}. ${m}`);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${memories.length} remembered fact${memories.length !== 1 ? "s" : ""}:\n${lines.join("\n")}`,
+          }]);
+        }
+        break;
+      }
+
+      case "/mode": {
+        const modeDesc: Record<PermissionMode, string> = {
+          default: "all tools, normal operation",
+          plan: "read-only tools only (no writes, no commands)",
+          yolo: "all tools, no confirmation",
+        };
+        const modes: PermissionMode[] = ["default", "plan", "yolo"];
+
+        if (args && modes.includes(args as PermissionMode)) {
+          // Explicit mode set: /mode plan
+          setPermissionMode(args as PermissionMode);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Mode: ${args}  (${modeDesc[args as PermissionMode]})`,
+          }]);
+        } else {
+          // Cycle through modes
+          const current = getPermissionMode();
+          const nextIdx = (modes.indexOf(current) + 1) % modes.length;
+          const next = modes[nextIdx];
+          setPermissionMode(next);
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `  ${symbols.check} Mode: ${next}  (${modeDesc[next]})`,
+          }]);
+        }
+        break;
+      }
+
       case "/tools": {
         const lines: string[] = [];
         lines.push(`  Local (${LOCAL_TOOL_DEFINITIONS.length})`);
@@ -396,6 +499,7 @@ export function ChatApp() {
     setCompletedSubagents([]);
     setTeamState(null);
     setIsStreaming(true);
+    thinkingVerbRef.current = randomVerb(); // Pick new verb per request, not per render
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -423,6 +527,22 @@ export function ChatApp() {
     let teamCompleted = 0;
     const teammateStatus = new Map<string, { name: string; status: string }>(); // id → { name, status }
 
+    // Helper: flush batched team state to React
+    const flushTeamState = () => {
+      if (teamTimerRef.current) { clearTimeout(teamTimerRef.current); teamTimerRef.current = null; }
+      setTeamState({ name: teamName, tasksCompleted: teamCompleted, tasksTotal: teamTotal, teammates: new Map(teammateStatus) });
+    };
+
+    // Helper: schedule debounced team state update (batches rapid events)
+    const scheduleTeamFlush = () => {
+      if (!teamTimerRef.current) {
+        teamTimerRef.current = setTimeout(() => {
+          teamTimerRef.current = null;
+          flushTeamState();
+        }, 200);
+      }
+    };
+
     const unsub = emitter.onEvent((event: AgentEvent) => {
       switch (event.type) {
         case "text":
@@ -440,10 +560,15 @@ export function ChatApp() {
           const idx = toolCalls.findIndex(t => t.name === event.toolName && t.status === "running");
           if (idx >= 0) {
             const prev = toolCalls[idx].result || "";
-            // Keep last 4 lines — less data = smaller re-render delta
             const lines = (prev + "\n" + event.line).split("\n");
             toolCalls[idx].result = lines.slice(-4).join("\n").trim();
-            setActiveTools([...toolCalls]);
+            // Throttle re-renders — batch rapid output lines (250ms)
+            if (!toolOutputTimerRef.current) {
+              toolOutputTimerRef.current = setTimeout(() => {
+                toolOutputTimerRef.current = null;
+                setActiveTools([...toolCalls]);
+              }, 250);
+            }
           }
           break;
         }
@@ -453,7 +578,7 @@ export function ChatApp() {
           teamTotal = event.taskCount;
           teamCompleted = 0;
           teammateStatus.clear();
-          setTeamState({ name: teamName, tasksCompleted: 0, tasksTotal: teamTotal, teammates: new Map(teammateStatus) });
+          flushTeamState(); // Immediate — show panel right away
           break;
 
         case "team_task":
@@ -468,15 +593,19 @@ export function ChatApp() {
             const existing = teammateStatus.get(event.teammateId);
             teammateStatus.set(event.teammateId, { name: existing?.name || event.teammateId, status: "failed" });
           }
-          setTeamState({ name: teamName, tasksCompleted: teamCompleted, tasksTotal: teamTotal, teammates: new Map(teammateStatus) });
+          // Task status changes are important — flush immediately
+          flushTeamState();
           break;
 
         case "team_progress":
           teammateStatus.set(event.teammateId, { name: event.teammateName || event.teammateId, status: event.message.slice(0, 50) });
-          setTeamState({ name: teamName, tasksCompleted: teamCompleted, tasksTotal: teamTotal, teammates: new Map(teammateStatus) });
+          // Progress updates are frequent — debounce to avoid excessive re-renders
+          scheduleTeamFlush();
           break;
 
         case "team_done":
+          // Flush any pending timer before clearing
+          if (teamTimerRef.current) { clearTimeout(teamTimerRef.current); teamTimerRef.current = null; }
           setTeamState(null);
           // Clear stale pre-team streaming text to prevent flash
           accTextRef.current = "";
@@ -607,6 +736,8 @@ export function ChatApp() {
           setActiveTools([...toolCalls]);
         },
         onToolResult: (name, success, result, input, durationMs) => {
+          // Flush any pending tool output timer
+          if (toolOutputTimerRef.current) { clearTimeout(toolOutputTimerRef.current); toolOutputTimerRef.current = null; }
           // Build the completed tool object
           const completedTool: ToolCall = {
             name,
@@ -699,6 +830,21 @@ export function ChatApp() {
   const termWidth = process.stdout.columns || 80;
   const contentWidth = Math.max(20, termWidth - 2);
 
+  // Split messages: all-but-last go to Static (stdout, never re-rendered),
+  // the last message stays in the dynamic area so content doesn't vanish
+  // from the user's viewport when generation finishes.
+  // IMPORTANT: Must be above early returns so hooks are called unconditionally.
+  const { staticItems, dynamicMessages } = useMemo(() => {
+    const items: StaticItem[] = [{ id: "header", type: "header" }];
+    // Keep last message in dynamic area; commit everything else to Static
+    const cutoff = Math.max(0, messages.length - 1);
+    for (let i = 0; i < cutoff; i++) {
+      items.push({ id: `msg-${i}`, type: "message", msg: messages[i], index: i });
+    }
+    const tail = messages.length > 0 ? [messages[messages.length - 1]] : [];
+    return { staticItems: items, dynamicMessages: tail };
+  }, [messages]);
+
   if (error) {
     return (
       <Box flexDirection="column" paddingLeft={1} paddingRight={1}>
@@ -720,21 +866,32 @@ export function ChatApp() {
 
   return (
     <Box flexDirection="column" paddingLeft={1} paddingRight={1}>
-      {/* Header */}
-      <Text>{" "}</Text>
-      <Text>
-        <Text color={colors.brand} bold>◆ whale code</Text>
-        {userLabel ? <Text color={colors.dim}>  {userLabel}</Text> : null}
-        <Text color={colors.dim}>  {currentModel}</Text>
-        {serverToolsAvailable > 0 ? (
-          <Text color={colors.tertiary}>  {symbols.dot} {serverToolsAvailable} server tools</Text>
-        ) : null}
-      </Text>
-      <Text color={colors.separator}>{"─".repeat(contentWidth)}</Text>
+      {/* Static area: header + all-but-last messages — committed to stdout, immune to re-renders */}
+      <Static items={staticItems}>
+        {(item: StaticItem) => {
+          if (item.type === "header") {
+            return (
+              <Box key={item.id} flexDirection="column">
+                <Text>{" "}</Text>
+                <Text>
+                  <Text color={colors.brand} bold>◆ whale code</Text>
+                  {userLabel ? <Text color={colors.dim}>  {userLabel}</Text> : null}
+                  <Text color={colors.dim}>  {currentModel}</Text>
+                  {serverToolsAvailable > 0 ? (
+                    <Text color={colors.tertiary}>  {symbols.dot} {serverToolsAvailable} server tools</Text>
+                  ) : null}
+                </Text>
+                <Text color={colors.separator}>{"─".repeat(contentWidth)}</Text>
+              </Box>
+            );
+          }
+          return <CompletedMessage key={item.id} msg={item.msg} index={item.index} toolsExpanded={toolsExpanded} />;
+        }}
+      </Static>
 
-      {/* All messages */}
-      {messages.map((msg, i) => (
-        <CompletedMessage key={i} msg={msg} index={i} toolsExpanded={toolsExpanded} />
+      {/* Last completed message — stays in dynamic area so content doesn't vanish from viewport */}
+      {dynamicMessages.map((msg, i) => (
+        <CompletedMessage key={`dynamic-${messages.length - 1}`} msg={msg} index={messages.length - 1} toolsExpanded={toolsExpanded} />
       ))}
 
       {/* During team mode: tree-style teammate status */}
@@ -747,7 +904,7 @@ export function ChatApp() {
             <Text>
               <Text color="#0A84FF">  </Text>
               <Text color="#0A84FF"><Spinner type="dots" /></Text>
-              <Text dimColor>  {randomVerb()}</Text>
+              <Text dimColor>  {thinkingVerbRef.current}</Text>
             </Text>
           )}
 

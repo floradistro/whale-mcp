@@ -209,10 +209,31 @@ export function getDisplayName(name: string): string {
   return TOOL_DISPLAY_NAMES[name] || name;
 }
 
+/** Shorten absolute paths in search/grep results for readable display */
+function formatSearchResult(result: string): string {
+  return result.split("\n").map(line => {
+    // Match "path:line:col:content" or "path:line:content" (grep/ripgrep output)
+    const grepMatch = line.match(/^(\/[^:]+):(\d+(?::\d+)?):(.*)$/);
+    if (grepMatch) {
+      const [, filePath, lineCol, rest] = grepMatch;
+      return `${shortenPath(filePath, 35)}:${lineCol}:${rest}`;
+    }
+    // Match plain absolute paths (glob results)
+    if (line.startsWith("/")) {
+      return shortenPath(line.trim(), 60);
+    }
+    return line;
+  }).join("\n");
+}
+
 function detectLang(toolName: string, input?: Record<string, unknown>): string {
   if (toolName === "edit_file" || toolName === "multi_edit") return "diff";
   if (toolName === "read_file" && input?.path) {
-    const ext = String(input.path).split(".").pop()?.toLowerCase() || "";
+    const p = String(input.path);
+    const base = p.split("/").pop() || "";
+    // .env, .env.local, .env.production, etc. → bash (KEY=VALUE syntax)
+    if (base.startsWith(".env")) return "bash";
+    const ext = base.split(".").pop()?.toLowerCase() || "";
     return LANG_MAP[ext] || "";
   }
   if (toolName === "run_command" || toolName === "list_directory") return "bash";
@@ -233,7 +254,8 @@ function wrapInFence(content: string, lang: string, subtitle?: string): string {
       lang = "json";
     }
   }
-  const fence = subtitle ? lang + ":" + subtitle : lang;
+  // Only add :subtitle when lang is non-empty (prevents "```:path" which has no valid lang)
+  const fence = (lang && subtitle) ? lang + ":" + subtitle : lang;
   return "```" + fence + "\n" + content + "\n```";
 }
 
@@ -374,7 +396,10 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
   // ── SUCCESS ──
   const hasResult = !!(result && result.trim());
   const isShort = lineCount <= AUTO_EXPAND_THRESHOLD;
-  const showFull = hasResult && (expanded || isShort);
+  // Read/write results stay collapsed (just header line) — Claude Code parity.
+  // Edit/search/command results auto-expand if short enough.
+  const collapseByDefault = category === "read" || category === "write" || category === "directory";
+  const showFull = hasResult && (expanded || (isShort && !collapseByDefault));
 
   return (
     <Box flexDirection="column">
@@ -405,25 +430,29 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
         {summary?.type === "server" && (
           <Text color="#64D2FF">  {(summary as any).label}</Text>
         )}
-        {!summary && hasResult && !isShort && !expanded && <Text dimColor>  {lineCount} lines</Text>}
+        {!summary && hasResult && !showFull && <Text dimColor>  {lineCount} lines</Text>}
       </Box>
 
       {/* Result — full, syntax highlighted */}
       {showFull && (
         <Box marginLeft={2} flexDirection="column">
-          <MarkdownText text={wrapInFence(result!, lang, filePath)} />
+          <MarkdownText text={wrapInFence(
+            category === "search" ? formatSearchResult(result!) : result!,
+            lang,
+            filePath
+          )} />
         </Box>
       )}
 
-      {/* Collapsed preview — also syntax highlighted */}
-      {hasResult && !showFull && (
+      {/* Preview for long results (edit/search/command only — reads stay fully collapsed) */}
+      {hasResult && !showFull && !collapseByDefault && (
         <Box flexDirection="column" marginLeft={2}>
-          <MarkdownText text={wrapInFence(result!.split("\n").slice(0, PREVIEW_LINES).join("\n"), lang, filePath)} />
-          <Box>
-            <Text dimColor>  └ </Text>
-            <Text dimColor>+{lineCount - PREVIEW_LINES} lines</Text>
-            <Text dimColor>  ^E</Text>
-          </Box>
+          <MarkdownText text={wrapInFence(
+            (category === "search" ? formatSearchResult(result!) : result!).split("\n").slice(0, PREVIEW_LINES).join("\n"),
+            lang,
+            filePath
+          )} />
+          <Text dimColor>  └ +{lineCount - PREVIEW_LINES} lines  ^E</Text>
         </Box>
       )}
     </Box>

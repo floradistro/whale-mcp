@@ -246,6 +246,38 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     description: "List available agent types",
     handler: () => ({ handled: true, action: "list_agents" }),
   },
+  {
+    name: "remember",
+    description: "Remember a fact across sessions",
+    handler: (args) => ({
+      handled: true,
+      action: "remember",
+      message: args.join(" "),
+    }),
+  },
+  {
+    name: "forget",
+    description: "Forget a remembered fact",
+    handler: (args) => ({
+      handled: true,
+      action: "forget",
+      message: args.join(" "),
+    }),
+  },
+  {
+    name: "memory",
+    description: "List all remembered facts",
+    handler: () => ({ handled: true, action: "list_memory" }),
+  },
+  {
+    name: "mode",
+    description: "Switch permission mode (default/plan/yolo)",
+    handler: (args) => ({
+      handled: true,
+      action: "set_mode",
+      message: args[0] || "",
+    }),
+  },
 ];
 
 export function getBuiltInCommand(name: string): BuiltInCommand | undefined {

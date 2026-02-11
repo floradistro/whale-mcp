@@ -20,6 +20,21 @@ interface TeamPanelProps {
   team: TeamInfo;
 }
 
+// Custom comparator — prevent re-render when Map contents haven't actually changed
+function teamPropsEqual(prev: TeamPanelProps, next: TeamPanelProps): boolean {
+  if (prev.team.name !== next.team.name) return false;
+  if (prev.team.tasksCompleted !== next.team.tasksCompleted) return false;
+  if (prev.team.tasksTotal !== next.team.tasksTotal) return false;
+  if (prev.team.teammates.size !== next.team.teammates.size) return false;
+
+  for (const [id, mate] of prev.team.teammates) {
+    const nextMate = next.team.teammates.get(id);
+    if (!nextMate) return false;
+    if (mate.name !== nextMate.name || mate.status !== nextMate.status) return false;
+  }
+  return true;
+}
+
 export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps) {
   const teammates = Array.from(team.teammates.entries());
 
@@ -50,7 +65,7 @@ export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps)
               <Text color="#FF453A">✕</Text>
             )}
             <Text color={color} dimColor={!color}> {mate.name || mate.status}</Text>
-            {mate.name && mate.status !== mate.name ? (
+            {mate.name && mate.status !== mate.name && mate.status !== "done" && mate.status !== "failed" ? (
               <Text dimColor> — {mate.status}</Text>
             ) : null}
           </Text>
@@ -58,4 +73,4 @@ export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps)
       })}
     </Box>
   );
-});
+}, teamPropsEqual);

@@ -10,6 +10,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync } from "fs";
+import { execSync } from "child_process";
 import { join, resolve, dirname } from "path";
 import { homedir } from "os";
 import {
@@ -346,6 +347,149 @@ export function compressContext(
 }
 
 // ============================================================================
+// GIT CONTEXT — gather branch, status, recent commits for system prompt
+// ============================================================================
+
+let cachedGitContext: string | null = null;
+let gitContextCwd: string | null = null;
+
+function gatherGitContext(): string {
+  const cwd = process.cwd();
+
+  // Return cached if same cwd
+  if (cachedGitContext !== null && gitContextCwd === cwd) return cachedGitContext;
+  gitContextCwd = cwd;
+
+  try {
+    // Check if we're in a git repo
+    execSync("git rev-parse --is-inside-work-tree", { cwd, encoding: "utf-8", timeout: 3000, stdio: ["pipe", "pipe", "pipe"] });
+  } catch {
+    cachedGitContext = "";
+    return "";
+  }
+
+  const parts: string[] = [];
+
+  try {
+    const branch = execSync("git branch --show-current", { cwd, encoding: "utf-8", timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (branch) parts.push(`Branch: ${branch}`);
+  } catch { /* skip */ }
+
+  try {
+    const status = execSync("git status --short 2>/dev/null | head -20", { cwd, encoding: "utf-8", timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (status) {
+      const lines = status.split("\n");
+      parts.push(`Status: ${lines.length} changed file${lines.length !== 1 ? "s" : ""}`);
+      parts.push(status);
+    } else {
+      parts.push("Status: clean");
+    }
+  } catch { /* skip */ }
+
+  try {
+    const log = execSync('git log --oneline -5 2>/dev/null', { cwd, encoding: "utf-8", timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (log) parts.push(`Recent commits:\n${log}`);
+  } catch { /* skip */ }
+
+  cachedGitContext = parts.length > 0 ? parts.join("\n") : "";
+  return cachedGitContext;
+}
+
+/** Force refresh of git context (e.g. after a commit) */
+export function refreshGitContext(): void {
+  cachedGitContext = null;
+  gitContextCwd = null;
+}
+
+// ============================================================================
+// PERSISTENT MEMORY — /remember and /forget across sessions
+// ============================================================================
+
+const MEMORY_DIR = join(homedir(), ".swagmanager", "memory");
+const MEMORY_FILE = join(MEMORY_DIR, "MEMORY.md");
+
+function ensureMemoryDir(): void {
+  if (!existsSync(MEMORY_DIR)) mkdirSync(MEMORY_DIR, { recursive: true });
+}
+
+export function loadMemory(): string {
+  if (!existsSync(MEMORY_FILE)) return "";
+  try {
+    return readFileSync(MEMORY_FILE, "utf-8").trim();
+  } catch { return ""; }
+}
+
+export function addMemory(fact: string): { success: boolean; message: string } {
+  ensureMemoryDir();
+  const existing = loadMemory();
+  const entry = `- ${fact}`;
+
+  // Check for duplicate
+  if (existing.includes(fact)) {
+    return { success: false, message: "Already remembered." };
+  }
+
+  const updated = existing ? existing + "\n" + entry : entry;
+  writeFileSync(MEMORY_FILE, updated + "\n", "utf-8");
+  return { success: true, message: `Remembered: ${fact}` };
+}
+
+export function removeMemory(pattern: string): { success: boolean; message: string } {
+  if (!existsSync(MEMORY_FILE)) return { success: false, message: "No memories stored." };
+
+  const content = readFileSync(MEMORY_FILE, "utf-8");
+  const lines = content.split("\n");
+  const lower = pattern.toLowerCase();
+  const filtered = lines.filter(line => !line.toLowerCase().includes(lower));
+
+  if (filtered.length === lines.length) {
+    return { success: false, message: `No memory matching "${pattern}" found.` };
+  }
+
+  const removed = lines.length - filtered.length;
+  writeFileSync(MEMORY_FILE, filtered.join("\n"), "utf-8");
+  return { success: true, message: `Forgot ${removed} memor${removed === 1 ? "y" : "ies"} matching "${pattern}".` };
+}
+
+export function listMemories(): string[] {
+  const content = loadMemory();
+  if (!content) return [];
+  return content.split("\n").filter(l => l.trim().startsWith("- ")).map(l => l.replace(/^- /, "").trim());
+}
+
+// ============================================================================
+// PERMISSION MODES — control tool access levels
+// ============================================================================
+
+export type PermissionMode = "default" | "plan" | "yolo";
+
+let activePermissionMode: PermissionMode = "default";
+
+// Tools allowed in each mode
+const PLAN_MODE_TOOLS = new Set([
+  "read_file", "list_directory", "search_files", "search_content",
+  "glob", "grep", "web_fetch", "web_search", "task", "task_output",
+  "bash_output", "list_shells", "todo_write",
+]);
+
+export function setPermissionMode(mode: PermissionMode): { success: boolean; message: string } {
+  activePermissionMode = mode;
+  return { success: true, message: `Permission mode: ${mode}` };
+}
+
+export function getPermissionMode(): PermissionMode {
+  return activePermissionMode;
+}
+
+export function isToolAllowedByPermission(toolName: string): boolean {
+  switch (activePermissionMode) {
+    case "yolo": return true;
+    case "plan": return PLAN_MODE_TOOLS.has(toolName);
+    case "default": return true; // Default allows all — UI can prompt for confirmation
+  }
+}
+
+// ============================================================================
 // SYSTEM PROMPT
 // ============================================================================
 
@@ -353,9 +497,15 @@ function buildSystemPrompt(hasServerTools: boolean): string {
   let prompt = `You are whale code, a CLI AI assistant.
 
 ## Working Directory
-${process.cwd()}
+${process.cwd()}`;
 
-## Tool Use
+  // Git context
+  const gitContext = gatherGitContext();
+  if (gitContext) {
+    prompt += `\n\n## Git\n${gitContext}`;
+  }
+
+  prompt += `\n\n## Tool Use
 - Call multiple independent tools in ONE response (parallel execution)
 - Only chain across turns when a result is needed for the next call
 - If a tool fails 3 times, try a different approach
@@ -363,6 +513,19 @@ ${process.cwd()}
 
   if (hasServerTools) {
     prompt += `\n- Use audit_trail for store activity, telemetry for AI system metrics`;
+  }
+
+  // Permission mode hint
+  if (activePermissionMode === "plan") {
+    prompt += `\n\n## Mode: Plan (read-only)\nYou are in plan mode. Only read/search tools are available. No file writes or commands.`;
+  } else if (activePermissionMode === "yolo") {
+    prompt += `\n\n## Mode: Yolo (full access)\nAll tools available without confirmation.`;
+  }
+
+  // Persistent memory
+  const memory = loadMemory();
+  if (memory) {
+    prompt += `\n\n## Memory (persistent across sessions)\n${memory}`;
   }
 
   const claudeMd = loadClaudeMd();
@@ -904,6 +1067,20 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         const toolStart = Date.now();
         let toolResult: { success: boolean; output: string };
 
+        // Permission mode enforcement
+        if (!isToolAllowedByPermission(tu.name)) {
+          toolResult = { success: false, output: `Tool "${tu.name}" blocked by ${activePermissionMode} mode. Switch modes with /mode.` };
+          const toolDurationMs = Date.now() - toolStart;
+          callbacks.onToolResult(tu.name, false, toolResult.output, tu.input, toolDurationMs);
+          emitter?.emitToolEnd(tu.id, tu.name, false, toolResult.output, tu.input, toolDurationMs);
+          toolResultMap.set(tu.id, {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: JSON.stringify({ error: toolResult.output }),
+          });
+          return;
+        }
+
         if (isLocalTool(tu.name)) {
           toolResult = await executeLocalTool(tu.name, tu.input);
 
@@ -1128,6 +1305,8 @@ export {
 
 // Re-export background process listing for /tasks command
 export { listProcesses, listBackgroundAgents } from "./background-processes.js";
+
+// Memory, permission mode, and git context are exported at their definition sites above
 
 // Re-export event emitter for ChatApp
 export { AgentEventEmitter, type AgentEvent } from "./agent-events.js";
