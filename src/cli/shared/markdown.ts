@@ -11,6 +11,11 @@ import { markedTerminal } from "marked-terminal";
 import chalk from "chalk";
 import { createRequire } from "module";
 
+// Force true color — macOS Terminal supports 24-bit since Ventura but doesn't
+// set COLORTERM=truecolor, so chalk/supports-color falls back to 256-color
+// which maps our subtle hex backgrounds (#1a3a2a etc.) to gray.
+if (chalk.level < 3) chalk.level = 3;
+
 const require = createRequire(import.meta.url);
 const { highlight } = require("cli-highlight") as typeof import("cli-highlight");
 
@@ -197,11 +202,11 @@ marked.use(
 // Diff renderer — background colors + word-level diff (Claude Code parity)
 // ============================================================================
 
-// Background colors for diff lines
-const diffAddedBg    = chalk.bgHex("#1a3a2a").hex("#69DB7C");  // green bg, bright green text
-const diffRemovedBg  = chalk.bgHex("#3a1a1e").hex("#FFA8B4");  // red bg, pink text
-const diffWordAdded  = chalk.bgHex("#2F9D44").hex("#FFFFFF");  // bright green bg for changed words
-const diffWordRemoved = chalk.bgHex("#D1454B").hex("#FFFFFF"); // bright red bg for changed words
+// Background colors for diff lines (true color required — forced above)
+const diffAddedBg    = chalk.bgHex("#1E3D28").hex("#69DB7C");  // dark green bg, bright green text
+const diffRemovedBg  = chalk.bgHex("#402428").hex("#FFA8B4");  // dark red bg, pink text
+const diffWordAdded  = chalk.bgHex("#2F7840").hex("#D0FFD8");  // brighter green bg, light green text
+const diffWordRemoved = chalk.bgHex("#803040").hex("#FFD0D8"); // brighter red bg, light pink text
 
 /** Compute word-level diff between two lines. Returns arrays of {text, changed} segments. */
 function wordDiff(oldLine: string, newLine: string): { old: {text: string; changed: boolean}[]; new: {text: string; changed: boolean}[] } {
