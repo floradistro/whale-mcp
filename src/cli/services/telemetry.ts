@@ -9,7 +9,32 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { resolveConfig, loadConfig } from "./config-store.js";
 import { getValidToken, SUPABASE_URL, createAuthenticatedClient } from "./auth-service.js";
-import type { ExecutionContext } from "../../tools/executor.js";
+// Telemetry context for tracing — formerly in executor.ts, now owned here.
+export interface ExecutionContext {
+  source: string;
+  userId?: string;
+  userEmail?: string;
+  traceId?: string;
+  spanId?: string;
+  parentSpanId?: string;
+  traceFlags?: number;
+  requestId?: string;
+  parentId?: string;
+  serviceName?: string;
+  serviceVersion?: string;
+  agentId?: string;
+  agentName?: string;
+  conversationId?: string;
+  turnNumber?: number;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCost?: number;
+  costBefore?: number;
+  turnCost?: number;
+  iteration?: number;
+  toolType?: string;
+}
 
 // ============================================================================
 // SESSION STATE

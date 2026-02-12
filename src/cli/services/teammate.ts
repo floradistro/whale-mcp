@@ -337,12 +337,23 @@ async function callAPI(
   let outputTokens = 0;
   let stopReason = "end_turn";
 
-  const stream = client.messages.stream({
+  // Beta API with tool result clearing — prevents old tool results from filling context
+  const stream = client.beta.messages.stream({
     model: modelId,
     max_tokens: MAX_OUTPUT_TOKENS,
     system: systemPrompt,
-    tools,
-    messages,
+    tools: tools as any,
+    messages: messages as any,
+    betas: ["context-management-2025-06-27"],
+    context_management: {
+      edits: [
+        {
+          type: "clear_tool_uses_20250919" as const,
+          trigger: { type: "input_tokens" as const, value: 80_000 },
+          keep: { type: "tool_uses" as const, value: 3 },
+        },
+      ],
+    },
   });
 
   for await (const event of stream) {
@@ -788,7 +799,7 @@ async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
           result = await executeLocalTool(tu.name, tu.input as Record<string, unknown>);
         } else if (isServerTool(tu.name)) {
           toolCategory = "server";
-          result = await executeServerTool(tu.name, tu.input as Record<string, unknown>, createTurnContext());
+          result = await executeServerTool(tu.name, tu.input as Record<string, unknown>);
         } else {
           result = { success: false, output: `Unknown tool: ${tu.name}` };
         }
@@ -824,10 +835,16 @@ async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
           },
         });
 
+        const MAX_TOOL_RESULT_CHARS = 30_000;
+        let contentStr = JSON.stringify(result.success ? result.output : { error: result.output });
+        if (contentStr.length > MAX_TOOL_RESULT_CHARS) {
+          contentStr = contentStr.slice(0, MAX_TOOL_RESULT_CHARS)
+            + `\n\n... (truncated — ${contentStr.length.toLocaleString()} chars total)`;
+        }
         toolResults.push({
           type: "tool_result",
           tool_use_id: tu.id,
-          content: JSON.stringify(result.success ? result.output : { error: result.output }),
+          content: contentStr,
         });
       }
 

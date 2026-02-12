@@ -284,13 +284,8 @@ function extractSessionTitle(messages: Anthropic.MessageParam[]): string {
 }
 
 // ============================================================================
-// CONTEXT MANAGEMENT — token-aware compression matching Claude Code behavior
+// CONTEXT MANAGEMENT — server-side via Anthropic beta API
 // ============================================================================
-
-// Token budget: 200K context window, leave room for output + system prompt
-const CONTEXT_TOKEN_BUDGET = 160_000;
-// Rough chars-per-token ratio for estimation (actual tracked via API usage)
-const CHARS_PER_TOKEN = 3.5;
 
 // Session-wide token tracking (actual counts from API responses)
 let sessionInputTokens = 0;
@@ -301,103 +296,28 @@ export function getSessionTokens(): { input: number; output: number } {
   return { input: sessionInputTokens, output: sessionOutputTokens };
 }
 
-/** Estimate token count from message content (fallback when no API count available) */
-function estimateTokens(messages: Anthropic.MessageParam[]): number {
-  let chars = 0;
-  for (const m of messages) {
-    if (typeof m.content === "string") {
-      chars += m.content.length;
-    } else if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        if ("text" in block) chars += (block.text as string).length;
-        else chars += JSON.stringify(block).length;
-      }
-    }
-  }
-  return Math.ceil(chars / CHARS_PER_TOKEN);
-}
-
-/** Check if context needs compression — uses actual token count if available */
-function needsCompaction(messages: Anthropic.MessageParam[]): boolean {
-  // Use actual count from last API call if available, otherwise estimate
-  const tokenCount = lastKnownInputTokens > 0
-    ? lastKnownInputTokens
-    : estimateTokens(messages);
-  return tokenCount > CONTEXT_TOKEN_BUDGET && messages.length >= 6;
-}
-
 /**
- * Compress conversation context — keeps recent messages, summarizes older ones.
- * Proportional: keeps ~40% of messages (min 6) to preserve more context than naive truncation.
+ * Context management config — sent to Anthropic beta API.
+ * Server-side compaction and tool result clearing replace our custom compressContext().
  */
-export function compressContext(
-  messages: Anthropic.MessageParam[],
-  callback?: (before: number, after: number, tokensSaved: number) => void
-): Anthropic.MessageParam[] {
-  if (!needsCompaction(messages)) return messages;
+const CONTEXT_MANAGEMENT_CONFIG = {
+  edits: [
+    {
+      type: "compact_20260112" as const,
+      trigger: { type: "input_tokens" as const, value: 150_000 },
+    },
+    {
+      type: "clear_tool_uses_20250919" as const,
+      trigger: { type: "input_tokens" as const, value: 100_000 },
+      keep: { type: "tool_uses" as const, value: 5 },
+    },
+  ],
+};
 
-  const beforeCount = messages.length;
-  const beforeTokens = estimateTokens(messages);
-
-  // Keep 40% of messages (min 6, max 20) — more proportional than fixed 4
-  const keepCount = Math.max(6, Math.min(20, Math.ceil(messages.length * 0.4)));
-  const toSummarize = messages.slice(0, messages.length - keepCount);
-  const toKeep = messages.slice(messages.length - keepCount);
-
-  // Build a compact summary of older messages
-  const summaryParts: string[] = [];
-  let toolsUsed: string[] = [];
-
-  for (const m of toSummarize) {
-    if (m.role === "user") {
-      const text = typeof m.content === "string"
-        ? m.content
-        : Array.isArray(m.content)
-          ? m.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ")
-          : "";
-      if (text) summaryParts.push(`User: ${text.slice(0, 300)}`);
-    } else if (m.role === "assistant") {
-      if (typeof m.content === "string") {
-        summaryParts.push(`Assistant: ${m.content.slice(0, 300)}`);
-      } else if (Array.isArray(m.content)) {
-        const textParts = m.content
-          .filter((b): b is Anthropic.TextBlock => b.type === "text")
-          .map((b) => b.text.slice(0, 200));
-        const tools = m.content
-          .filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use")
-          .map((b) => b.name);
-        toolsUsed.push(...tools);
-        if (textParts.length) {
-          summaryParts.push(`Assistant: ${textParts.join(" ")}`);
-        }
-      }
-    }
-  }
-
-  // Deduplicate tool list
-  const uniqueTools = [...new Set(toolsUsed)];
-  const toolsSummary = uniqueTools.length > 0
-    ? `\nTools used in earlier context: ${uniqueTools.join(", ")}`
-    : "";
-
-  const summary = `[Context auto-compacted — ${toSummarize.length} earlier messages summarized]${toolsSummary}\n\n${summaryParts.join("\n")}`;
-
-  const compressed = [
-    { role: "user" as const, content: summary },
-    { role: "assistant" as const, content: "Understood, I have the context from our earlier conversation. I'll continue from where we left off." },
-    ...toKeep,
-  ];
-
-  const afterTokens = estimateTokens(compressed);
-  const tokensSaved = beforeTokens - afterTokens;
-
-  // Reset last known input tokens so next API call refreshes it
-  lastKnownInputTokens = 0;
-
-  if (callback) callback(beforeCount, compressed.length, tokensSaved);
-
-  return compressed;
-}
+const CONTEXT_MANAGEMENT_BETAS: string[] = [
+  "compact-2026-01-12",
+  "context-management-2025-06-27",
+];
 
 // ============================================================================
 // GIT CONTEXT — gather branch, status, recent commits for system prompt
@@ -771,13 +691,18 @@ async function* streamDirect(
     },
   ];
 
-  const stream = await anthropic.messages.create({
+  // Beta API with server-side context management:
+  // - compact_20260112: auto-summarizes when input exceeds 150K tokens
+  // - clear_tool_uses_20250919: clears old tool results when input exceeds 100K tokens (keeps last 5)
+  const stream = await anthropic.beta.messages.create({
     model: activeModel,
     max_tokens: maxTokens,
-    system: system as any, // cache_control typed in beta API, works on all models
-    tools,
-    messages,
+    system,
+    tools: tools as any,
+    messages: messages as any,
     stream: true,
+    betas: CONTEXT_MANAGEMENT_BETAS,
+    context_management: CONTEXT_MANAGEMENT_CONFIG,
   });
 
   for await (const event of stream) {
@@ -797,6 +722,10 @@ interface StreamResult {
   totalOut: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  /** Compaction content from server-side context management (if fired) */
+  compactionContent: string | null;
+  /** Whether server-side context management applied any edits */
+  contextManagementApplied: boolean;
 }
 
 async function processStreamEvents(
@@ -813,6 +742,11 @@ async function processStreamEvents(
   let cacheCreationTokens = 0;
   let cacheReadTokens = 0;
 
+  // Server-side context management tracking
+  let compactionContent: string | null = null;
+  let isCompactionBlock = false;
+  let contextManagementApplied = false;
+
   for await (const event of events) {
     if (signal?.aborted) break;
 
@@ -822,6 +756,10 @@ async function processStreamEvents(
           currentToolUse = { id: event.content_block.id, name: event.content_block.name, input: "" };
           callbacks.onToolStart(event.content_block.name);
           emitter?.emitToolStart(event.content_block.id, event.content_block.name);
+        } else if (event.content_block?.type === "compaction") {
+          // Server-side compaction block — track it for inclusion in messages
+          isCompactionBlock = true;
+          compactionContent = "";
         }
         break;
 
@@ -836,6 +774,11 @@ async function processStreamEvents(
           }
         } else if (event.delta?.type === "input_json_delta" && currentToolUse) {
           currentToolUse.input += event.delta.partial_json;
+        } else if (event.delta?.type === "compaction_delta" && isCompactionBlock) {
+          // Accumulate compaction summary content
+          if (event.delta.content != null) {
+            compactionContent = (compactionContent || "") + event.delta.content;
+          }
         }
         break;
 
@@ -853,6 +796,10 @@ async function processStreamEvents(
           } catch { /* skip bad JSON */ }
           currentToolUse = null;
         }
+        if (isCompactionBlock) {
+          isCompactionBlock = false;
+          contextManagementApplied = true;
+        }
         break;
 
       case "message_start":
@@ -865,6 +812,10 @@ async function processStreamEvents(
 
       case "message_delta":
         if (event.usage) totalOut += event.usage.output_tokens;
+        // Check for context_management applied edits
+        if (event.delta?.context_management?.applied_edits?.length > 0) {
+          contextManagementApplied = true;
+        }
         break;
 
       case "error": {
@@ -888,7 +839,7 @@ async function processStreamEvents(
     emitter.emitUsage(totalIn, totalOut);
   }
 
-  return { text, toolUseBlocks, totalIn, totalOut, cacheCreationTokens, cacheReadTokens };
+  return { text, toolUseBlocks, totalIn, totalOut, cacheCreationTokens, cacheReadTokens, compactionContent, contextManagementApplied };
 }
 
 // ============================================================================
@@ -918,6 +869,8 @@ async function getEventStream(
           model: activeModel,
           max_tokens: getMaxOutputTokens(),
           stream: true,
+          betas: CONTEXT_MANAGEMENT_BETAS,
+          context_management: CONTEXT_MANAGEMENT_CONFIG,
         }),
         signal,
       });
@@ -970,13 +923,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   const { tools, serverToolCount } = await getTools(opts.allowedTools, opts.disallowedTools);
   const systemPrompt = buildSystemPrompt(serverToolCount > 0, opts.effort);
 
-  // Apply context compression before starting — notify user if it fires
-  const compressedHistory = compressContext(conversationHistory, (before, after, saved) => {
-    callbacks.onAutoCompact?.(before, after, saved);
-    emitter?.emitCompact(before, after, saved);
-  });
+  // Context management is now server-side (Anthropic beta API handles compaction + tool clearing)
   const messages: Anthropic.MessageParam[] = [
-    ...compressedHistory,
+    ...conversationHistory,
     { role: "user", content: message },
   ];
 
@@ -1015,31 +964,6 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       if (opts.maxBudgetUsd && sessionCostUsd >= opts.maxBudgetUsd) {
         callbacks.onError(`Budget exceeded: $${sessionCostUsd.toFixed(4)} >= $${opts.maxBudgetUsd}`, messages);
         return;
-      }
-
-      // Mid-loop auto-compact: if context grew large during tool use, compress before next API call
-      if (iteration > 0 && needsCompaction(messages)) {
-        const compactStart = Date.now();
-        const beforeCount = messages.length;
-        const compressed = compressContext(messages, (before, after, saved) => {
-          callbacks.onAutoCompact?.(before, after, saved);
-          emitter?.emitCompact(before, after, saved);
-
-          logSpan({
-            action: "chat.context_compaction",
-            durationMs: Date.now() - compactStart,
-            context: turnCtx,
-            storeId: storeId || undefined,
-            details: {
-              messages_before: before,
-              messages_after: after,
-              tokens_saved: saved,
-              iteration,
-            },
-          });
-        });
-        messages.length = 0;
-        messages.push(...compressed);
       }
 
       const apiStart = Date.now();
@@ -1105,6 +1029,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
 
       // Track cost
       sessionCostUsd += estimateCostUsd(result.totalIn, result.totalOut);
+
+      // Server-side context management: fire onAutoCompact callback when compaction detected
+      if (result.contextManagementApplied) {
+        callbacks.onAutoCompact?.(messages.length, messages.length, 0);
+        emitter?.emitCompact(messages.length, messages.length, 0);
+
+        logSpan({
+          action: "chat.api_compaction",
+          durationMs: Date.now() - apiStart,
+          context: turnCtx,
+          storeId: storeId || undefined,
+          details: {
+            type: "server_side",
+            has_compaction_content: result.compactionContent !== null,
+            iteration,
+          },
+        });
+      }
 
       // Collect assistant text for telemetry
       if (result.text) {
@@ -1231,14 +1173,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             },
           });
         } else if (isServerTool(tu.name)) {
-          // Server tools log via executor.ts (sanitized args, retryable, sub-actions, bytes).
-          // Pass agent-loop context so executor captures iteration + parentSpanId + toolType.
-          toolResult = await executeServerTool(tu.name, tu.input, {
-            ...turnCtx,
-            parentSpanId: apiSpanId,
-            iteration,
-            toolType: "server",
-          });
+          // Server tools proxied to edge function — single source of truth.
+          toolResult = await executeServerTool(tu.name, tu.input);
         } else {
           toolResult = { success: false, output: `Unknown tool: ${tu.name}` };
         }
@@ -1270,10 +1206,19 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             ],
           };
         } else {
+          // Cap tool result content sent to Claude (~30K chars ≈ 7.5K tokens).
+          // Prevents massive JSON responses (e.g. raw DB dumps) from blowing context.
+          const MAX_TOOL_RESULT_CHARS = 30_000;
+          const rawContent = toolResult.success ? toolResult.output : { error: toolResult.output };
+          let contentStr = typeof rawContent === "string" ? rawContent : JSON.stringify(rawContent);
+          if (contentStr.length > MAX_TOOL_RESULT_CHARS) {
+            contentStr = contentStr.slice(0, MAX_TOOL_RESULT_CHARS)
+              + `\n\n... (truncated — ${contentStr.length.toLocaleString()} chars total. Ask for a narrower query.)`;
+          }
           resultBlock = {
             type: "tool_result",
             tool_use_id: tu.id,
-            content: JSON.stringify(toolResult.success ? toolResult.output : { error: toolResult.output }),
+            content: contentStr,
           };
         }
         toolResultMap.set(tu.id, resultBlock);
@@ -1295,18 +1240,23 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       }
 
       // Append assistant response + tool results for next turn
-      messages.push({
-        role: "assistant",
-        content: [
-          ...(result.text ? [{ type: "text" as const, text: result.text }] : []),
-          ...result.toolUseBlocks.map((t) => ({
-            type: "tool_use" as const,
-            id: t.id,
-            name: t.name,
-            input: t.input,
-          })),
-        ],
-      });
+      // Include compaction block if present — API requires it in subsequent turns
+      const assistantContent: any[] = [];
+      if (result.compactionContent !== null) {
+        assistantContent.push({ type: "compaction", content: result.compactionContent });
+      }
+      if (result.text) {
+        assistantContent.push({ type: "text" as const, text: result.text });
+      }
+      assistantContent.push(
+        ...result.toolUseBlocks.map((t) => ({
+          type: "tool_use" as const,
+          id: t.id,
+          name: t.name,
+          input: t.input,
+        })),
+      );
+      messages.push({ role: "assistant", content: assistantContent });
       messages.push({ role: "user", content: toolResults });
     }
 

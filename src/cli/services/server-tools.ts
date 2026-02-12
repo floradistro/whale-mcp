@@ -4,16 +4,15 @@
  * Single source of truth: the database. Same as the MCP server (index.ts).
  * No hardcoded definitions. Tools are cached for 60s after first load.
  *
- * Execution: direct import of executeTool() from executor.ts.
- * Supabase client: service role key preferred, user JWT fallback.
+ * Execution: proxied to the agent-chat edge function (mode: "tool").
+ * All business logic lives server-side — CLI is a thin client.
+ * Claude formats the JSON results for the user (no client-side formatter).
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { resolveConfig } from "./config-store.js";
 import { getValidToken, SUPABASE_URL, createAuthenticatedClient } from "./auth-service.js";
-import { executeTool, type ExecutionContext, type ToolResult as ServerToolResult } from "../../tools/executor.js";
-import { formatServerResponse } from "./format-server-response.js";
 
 // ============================================================================
 // TYPES
@@ -34,21 +33,23 @@ export interface ServerStatus {
 
 // ============================================================================
 // SUPABASE CLIENT (tiered: service role > user JWT)
+// Used only for loading tool definitions from ai_tool_registry.
+// Tool execution goes through the edge function.
 // ============================================================================
 
 let cachedClient: SupabaseClient | null = null;
 let cachedStoreId: string = "";
 let cachedAuthMethod: "service_role" | "jwt" | "none" = "none";
+let cachedToken: string = "";
 
 async function getSupabaseClient(): Promise<{ client: SupabaseClient; storeId: string } | null> {
-  if (cachedClient) {
-    return { client: cachedClient, storeId: cachedStoreId };
-  }
-
   const config = resolveConfig();
 
-  // Tier 1: Service role key (full access, MCP server mode)
+  // Tier 1: Service role key (full access, MCP server mode) — never expires
   if (config.supabaseUrl && config.supabaseKey) {
+    if (cachedClient && cachedAuthMethod === "service_role") {
+      return { client: cachedClient, storeId: cachedStoreId };
+    }
     cachedClient = createClient(config.supabaseUrl, config.supabaseKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
@@ -57,15 +58,22 @@ async function getSupabaseClient(): Promise<{ client: SupabaseClient; storeId: s
     return { client: cachedClient, storeId: cachedStoreId };
   }
 
-  // Tier 2: User JWT (CLI login)
+  // Tier 2: User JWT (CLI login) — recreate client when token refreshes
   const token = await getValidToken();
   if (token) {
+    if (cachedClient && cachedToken === token) {
+      cachedStoreId = config.storeId || "";
+      return { client: cachedClient, storeId: cachedStoreId };
+    }
     cachedClient = createAuthenticatedClient(token);
+    cachedToken = token;
     cachedStoreId = config.storeId || "";
     cachedAuthMethod = "jwt";
     return { client: cachedClient, storeId: cachedStoreId };
   }
 
+  cachedClient = null;
+  cachedToken = "";
   cachedAuthMethod = "none";
   return null;
 }
@@ -73,7 +81,9 @@ async function getSupabaseClient(): Promise<{ client: SupabaseClient; storeId: s
 export function resetServerToolClient(): void {
   cachedClient = null;
   cachedStoreId = "";
+  cachedToken = "";
   cachedAuthMethod = "none";
+  connectionVerified = false;
   // Also clear tool cache so next load fetches fresh
   loadedTools = [];
   loadedToolNames.clear();
@@ -195,42 +205,63 @@ export async function getServerStatus(): Promise<ServerStatus> {
 }
 
 // ============================================================================
-// EXECUTE SERVER TOOL
+// EXECUTE SERVER TOOL — proxied to edge function
 // ============================================================================
 
+/**
+ * Execute a server tool via the agent-chat edge function (mode: "tool").
+ * Returns the raw JSON from the edge function — Claude formats it for the user.
+ * No client-side formatting: the model is the presentation layer.
+ */
 export async function executeServerTool(
   name: string,
   input: Record<string, unknown>,
-  context?: ExecutionContext
 ): Promise<ToolResult> {
-  const conn = await getSupabaseClient();
-  if (!conn) {
-    return { success: false, output: "No Supabase connection — server tools unavailable. Run: whale login" };
+  const config = resolveConfig();
+  const supabaseUrl = config.supabaseUrl || SUPABASE_URL;
+  if (!supabaseUrl) {
+    return { success: false, output: "No Supabase URL configured — server tools unavailable. Run: whale login" };
+  }
+
+  // Auth token: service role key preferred, user JWT fallback
+  let authToken = config.supabaseKey;
+  if (!authToken) {
+    authToken = await getValidToken() || "";
+  }
+  if (!authToken) {
+    return { success: false, output: "No auth token — server tools unavailable. Run: whale login" };
   }
 
   try {
-    const enrichedContext: ExecutionContext = {
-      ...context,
-      source: context?.source || "whale_mcp",
-    };
+    const edgeFunctionUrl = `${supabaseUrl}/functions/v1/agent-chat`;
+    const response = await fetch(edgeFunctionUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({
+        mode: "tool",
+        tool_name: name,
+        args: input,
+        store_id: config.storeId || undefined,
+      }),
+    });
 
-    const result: ServerToolResult = await executeTool(
-      conn.client,
-      name,
-      input,
-      conn.storeId || undefined,
-      enrichedContext
-    );
+    const result = await response.json() as { success: boolean; data?: unknown; error?: string };
 
     if (result.success) {
-      // Try beautiful markdown formatting first, fall back to JSON
-      const formatted = formatServerResponse(name, input, result.data);
-      if (formatted) {
-        return { success: true, output: formatted };
-      }
-      const output = typeof result.data === "string"
+      // Return raw JSON — Claude formats it for the user
+      let output = typeof result.data === "string"
         ? result.data
         : JSON.stringify(result.data, null, 2);
+
+      // Pre-truncate large results to prevent context blowout
+      const MAX_SERVER_RESULT_CHARS = 30_000;
+      if (output.length > MAX_SERVER_RESULT_CHARS) {
+        output = output.slice(0, MAX_SERVER_RESULT_CHARS)
+          + `\n\n... (truncated — ${output.length.toLocaleString()} chars total. Use filters or limit param for smaller results.)`;
+      }
       return { success: true, output };
     }
 

@@ -1171,7 +1171,11 @@ async function runCommand(input: Record<string, unknown>): Promise<ToolResult> {
       if (killed) {
         resolve({ success: false, output: `Command timed out after ${timeout}ms.\n${output}`.slice(0, 5000) });
       } else if (code === 0) {
-        resolve({ success: true, output: output || "(no output)" });
+        let out = output || "(no output)";
+        if (out.length > 30_000) {
+          out = out.slice(0, 30_000) + `\n\n... (truncated — ${output.length.toLocaleString()} chars total)`;
+        }
+        resolve({ success: true, output: out });
       } else {
         resolve({ success: false, output: `Exit code ${code ?? "?"}:\n${output}`.slice(0, 5000) });
       }

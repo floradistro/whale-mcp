@@ -8,7 +8,6 @@ import Spinner from "ink-spinner";
 import { createClient } from "@supabase/supabase-js";
 import { resolveConfig, loadConfig } from "../services/config-store.js";
 import { isLoggedIn, getValidToken, createAuthenticatedClient } from "../services/auth-service.js";
-import { getImplementedTools } from "../../tools/executor.js";
 import { LOCAL_TOOL_NAMES } from "../services/local-tools.js";
 import { WhaleBanner } from "../shared/WhaleBanner.js";
 import { colors, symbols, boxLine } from "../shared/Theme.js";
@@ -31,7 +30,6 @@ interface StatusData {
   storeId: string;
   storeName: string;
   serverTools: number;
-  implTools: number;
   localTools: number;
   agents: Array<{ id: string; name: string; model: string; enabled_tools: string[] }>;
   loggedIn: boolean;
@@ -58,7 +56,6 @@ export function StatusApp() {
       const config = resolveConfig();
       const file = loadConfig();
       const version = getVersion();
-      const implTools = getImplementedTools();
       const loggedIn = isLoggedIn();
 
       let supabase;
@@ -74,7 +71,7 @@ export function StatusApp() {
           version, supabaseOk: false,
           storeId: config.storeId || file.store_id || "—",
           storeName: file.store_name || "",
-          serverTools: 0, implTools: implTools.length, localTools: LOCAL_TOOL_NAMES.size,
+          serverTools: 0, localTools: LOCAL_TOOL_NAMES.size,
           agents: [], loggedIn, email: file.email || "",
           error: loggedIn ? "Session expired. Run: whale login" : "Not configured. Run: whale login",
         });
@@ -95,8 +92,7 @@ export function StatusApp() {
           storeId: config.storeId || file.store_id || "—",
           storeName: file.store_name || storeRes.data?.name || "",
           serverTools: toolsRes.data?.length || 0,
-          implTools: implTools.length,
-          localTools: LOCAL_TOOL_NAMES.size,
+                   localTools: LOCAL_TOOL_NAMES.size,
           agents: (agentsRes.data || []) as StatusData["agents"],
           loggedIn, email: file.email || "",
         });
@@ -105,7 +101,7 @@ export function StatusApp() {
           version, supabaseOk: false,
           storeId: config.storeId || file.store_id || "—",
           storeName: file.store_name || "",
-          serverTools: 0, implTools: implTools.length, localTools: LOCAL_TOOL_NAMES.size,
+          serverTools: 0, localTools: LOCAL_TOOL_NAMES.size,
           agents: [], loggedIn, email: file.email || "",
           error: `Connection failed: ${err}`,
         });
@@ -159,9 +155,8 @@ export function StatusApp() {
 
       {/* Tools */}
       <Box height={1} />
-      <Row label="server tools" value={String(status.serverTools)} />
+      <Row label="server tools" value={`${status.serverTools} (edge function)`} />
       <Row label="local tools" value={`${status.localTools} (file, shell, search)`} />
-      <Row label="implemented" value={String(status.implTools)} />
 
       {/* Only show Anthropic key in legacy mode */}
       {!status.loggedIn && (

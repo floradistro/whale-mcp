@@ -20,23 +20,25 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient } from "@supabase/supabase-js";
 import { startUpdateLoop } from "./updater.js";
+import { resolveConfig } from "./cli/services/config-store.js";
 
 // ============================================================================
-// CONFIGURATION
+// CONFIGURATION — env vars → ~/.swagmanager/config.json (set by `whale login`)
 // ============================================================================
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const STORE_ID = process.env.STORE_ID || "";
+const config = resolveConfig();
+const SUPABASE_URL = config.supabaseUrl;
+const SUPABASE_KEY = config.supabaseKey;
+const STORE_ID = config.storeId;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("Error: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables required");
+  console.error("Error: Not authenticated. Run `whale login` first, or set env vars:");
   console.error("");
-  console.error("Set them in your MCP client config:");
-  console.error('  "env": {');
-  console.error('    "SUPABASE_URL": "https://your-project.supabase.co",');
-  console.error('    "SUPABASE_SERVICE_ROLE_KEY": "your-key-here"');
-  console.error("  }");
+  console.error("  whale login");
+  console.error("");
+  console.error("Or manually set environment variables:");
+  console.error('  SUPABASE_URL="https://your-project.supabase.co"');
+  console.error('  SUPABASE_SERVICE_ROLE_KEY="your-key-here"');
   process.exit(1);
 }
 
@@ -142,7 +144,7 @@ async function executeToolRemote(
 // ============================================================================
 
 const server = new Server(
-  { name: "swagmanager", version: "2.0.0" },
+  { name: "whale", version: "4.7.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -194,7 +196,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================================
 
 async function main() {
-  console.error("[MCP] SwagManager MCP Server v2.0.0 (proxy mode)");
+  console.error("[MCP] Whale MCP Server v4.7.0");
   console.error(`[MCP] Supabase: ${SUPABASE_URL}`);
   console.error(`[MCP] Edge function: ${EDGE_FUNCTION_URL}`);
   console.error(`[MCP] Store: ${STORE_ID || "(default)"}`);

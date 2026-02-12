@@ -15,7 +15,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   runAgentLoop, canUseAgent, getServerToolCount, getServerStatus,
   setModel, getModel, getModelShortName,
-  loadClaudeMd, compressContext, getSessionTokens,
+  loadClaudeMd, getSessionTokens,
   saveSession, loadSession, listSessions, type SessionMeta,
   addMemory, removeMemory, listMemories,
   setPermissionMode, getPermissionMode, type PermissionMode,
@@ -290,17 +290,10 @@ export function ChatApp() {
       }
 
       case "/compact": {
-        const before = conversationRef.current.length;
-        if (before < 6) {
-          setMessages((prev) => [...prev, { role: "assistant", text: "  Conversation too short to compress." }]);
-        } else {
-          conversationRef.current = compressContext(conversationRef.current);
-          const after = conversationRef.current.length;
-          setMessages((prev) => [...prev, {
-            role: "assistant",
-            text: `  ${symbols.check} Compressed: ${before} messages → ${after} messages`,
-          }]);
-        }
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: `  Context management is now handled server-side by the Anthropic API. Compaction fires automatically when context exceeds 150K tokens.`,
+        }]);
         break;
       }
 
