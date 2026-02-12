@@ -7,6 +7,26 @@
 import React from "react";
 import { render } from "ink";
 
+// ============================================================================
+// CHAT OPTIONS — passed from CLI argument parsing
+// ============================================================================
+
+export interface ChatOptions {
+  model?: string;
+  permissionMode?: string;
+  resumeSessionId?: string;
+  continueLastSession?: boolean;
+  sessionId?: string;
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+  effort?: string;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  fallbackModel?: string;
+  debug?: boolean;
+  verbose?: boolean;
+}
+
 export async function renderLogin(): Promise<void> {
   const { LoginApp } = await import("./login/LoginApp.js");
   const { waitUntilExit } = render(<LoginApp />);
@@ -23,9 +43,19 @@ export async function renderLogout(): Promise<void> {
   }
 }
 
-export async function renderChat(): Promise<void> {
+export async function renderChat(options?: ChatOptions): Promise<void> {
   const { matrixIntro } = await import("./shared/MatrixIntro.js");
   await matrixIntro();
+
+  // Apply options before starting chat
+  if (options?.model || options?.permissionMode) {
+    const agentLoop = await import("./services/agent-loop.js");
+    if (options.model) agentLoop.setModel(options.model);
+    if (options.permissionMode) {
+      agentLoop.setPermissionMode(options.permissionMode as "default" | "plan" | "yolo");
+    }
+  }
+
   const { ChatApp } = await import("./chat/ChatApp.js");
   const { waitUntilExit } = render(<ChatApp />);
   await waitUntilExit();

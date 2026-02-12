@@ -107,7 +107,7 @@ const handlers: Record<string, ToolHandler> = {
   inventory: async (supabase, args, storeId) => {
     const action = args.action as string;
     if (!action) {
-      return { success: false, error: "action required: adjust, set, transfer, bulk_adjust, bulk_set, bulk_clear" };
+      return { success: false, error: "action required: adjust, set, transfer, bulk_adjust, bulk_set, bulk_clear, summary, velocity, by_location, in_stock, audit_start, audit_count, audit_complete, audit_summary" };
     }
 
     try {
@@ -378,23 +378,8 @@ const handlers: Record<string, ToolHandler> = {
           return { success: true, data: { cleared: data?.length || 0, location_id: locationId } };
         }
 
-        default:
-          return { success: false, error: `Unknown action: ${action}. Use: adjust, set, transfer, bulk_adjust, bulk_set, bulk_clear` };
-      }
-    } catch (err) {
-      return { success: false, error: `Inventory error: ${err}` };
-    }
-  },
+        // --- Query actions (formerly inventory_query) ---
 
-  // ===========================================================================
-  // 2. INVENTORY_QUERY - Query inventory data
-  // Actions: summary, velocity, by_location, in_stock
-  // ===========================================================================
-  inventory_query: async (supabase, args, storeId) => {
-    const action = args.action as string || "summary";
-
-    try {
-      switch (action) {
         case "summary": {
           let q = supabase
             .from("inventory")
@@ -420,7 +405,6 @@ const handlers: Record<string, ToolHandler> = {
           const locationId = args.location_id as string;
           const limit = (args.limit as number) || 50;
 
-          // Use the proper RPC function with category/location/product filters
           const { data, error } = await supabase.rpc("get_product_velocity", {
             p_store_id: storeId || null,
             p_days: days,
@@ -432,7 +416,6 @@ const handlers: Record<string, ToolHandler> = {
 
           if (error) return { success: false, error: error.message };
 
-          // Transform RPC result rows (column names from TABLE return type)
           const products = (data || []).map((row: any) => ({
             productId: row.product_id,
             name: row.product_name,
@@ -456,7 +439,7 @@ const handlers: Record<string, ToolHandler> = {
 
         case "by_location": {
           const locationId = args.location_id as string;
-          if (!locationId) return { success: false, error: "location_id required for by_location query" };
+          if (!locationId) return { success: false, error: "location_id required for by_location action" };
 
           const { data, error } = await supabase
             .from("inventory")
@@ -483,43 +466,25 @@ const handlers: Record<string, ToolHandler> = {
           return { success: true, data };
         }
 
-        default:
-          return { success: false, error: `Unknown action: ${action}. Use: summary, velocity (supports category_id, location_id, product_id, days, limit), by_location, in_stock` };
-      }
-    } catch (err) {
-      return { success: false, error: `Inventory query error: ${err}` };
-    }
-  },
+        // --- Audit actions (formerly inventory_audit) ---
 
-  // ===========================================================================
-  // 3. INVENTORY_AUDIT - Audit workflow
-  // Actions: start, count, complete, summary
-  // ===========================================================================
-  inventory_audit: async (supabase, args, storeId) => {
-    const action = args.action as string;
-    if (!action) {
-      return { success: false, error: "action required: start, count, complete, summary" };
-    }
-
-    try {
-      switch (action) {
-        case "start":
+        case "audit_start":
           return { success: true, data: { message: "Audit started", location_id: args.location_id || storeId, started_at: new Date().toISOString() } };
 
-        case "count":
+        case "audit_count":
           return { success: true, data: { message: "Count recorded", product_id: args.product_id, counted: args.counted, location_id: args.location_id } };
 
-        case "complete":
+        case "audit_complete":
           return { success: true, data: { message: "Audit completed", completed_at: new Date().toISOString() } };
 
-        case "summary":
+        case "audit_summary":
           return { success: true, data: { discrepancies: [], matched: 0, total: 0 } };
 
         default:
-          return { success: false, error: `Unknown action: ${action}. Use: start, count, complete, summary` };
+          return { success: false, error: `Unknown action: ${action}. Use: adjust, set, transfer, bulk_adjust, bulk_set, bulk_clear, summary, velocity, by_location, in_stock, audit_start, audit_count, audit_complete, audit_summary` };
       }
     } catch (err) {
-      return { success: false, error: `Inventory audit error: ${err}` };
+      return { success: false, error: `Inventory error: ${err}` };
     }
   },
 
@@ -1196,6 +1161,58 @@ const handlers: Record<string, ToolHandler> = {
   },
 
   // ===========================================================================
+  // SUPPLY_CHAIN — consolidated routing for purchase_orders + transfers + suppliers
+  // Prefixed actions: po_create, po_list, ..., transfer_create, ..., find_suppliers
+  // ===========================================================================
+  supply_chain: async (supabase, args, storeId) => {
+    const action = args.action as string;
+    if (!action) {
+      return { success: false, error: "action required: po_create, po_list, po_get, po_add_items, po_approve, po_receive, po_cancel, transfer_create, transfer_list, transfer_get, transfer_receive, transfer_cancel, find_suppliers" };
+    }
+
+    // Route PO actions → purchase_orders handler
+    if (action.startsWith("po_")) {
+      const poAction = action.slice(3); // strip "po_"
+      return handlers.purchase_orders(supabase, { ...args, action: poAction }, storeId);
+    }
+
+    // Route transfer actions → transfers handler
+    if (action.startsWith("transfer_")) {
+      const trAction = action.slice(9); // strip "transfer_"
+      return handlers.transfers(supabase, { ...args, action: trAction }, storeId);
+    }
+
+    // Route supplier lookup
+    if (action === "find_suppliers") {
+      return handlers.suppliers(supabase, args, storeId);
+    }
+
+    return { success: false, error: `Unknown action: ${action}. Use: po_create, po_list, po_get, po_add_items, po_approve, po_receive, po_cancel, transfer_create, transfer_list, transfer_get, transfer_receive, transfer_cancel, find_suppliers` };
+  },
+
+  // ===========================================================================
+  // STORE — consolidated routing for store_info + locations + alerts
+  // Actions: info, locations, alerts
+  // ===========================================================================
+  store: async (supabase, args, storeId) => {
+    const action = args.action as string;
+    if (!action) {
+      return { success: false, error: "action required: info, locations, alerts" };
+    }
+
+    switch (action) {
+      case "info":
+        return handlers.store_info(supabase, args, storeId);
+      case "locations":
+        return handlers.locations(supabase, args, storeId);
+      case "alerts":
+        return handlers.alerts(supabase, args, storeId);
+      default:
+        return { success: false, error: `Unknown action: ${action}. Use: info, locations, alerts` };
+    }
+  },
+
+  // ===========================================================================
   // 4. COLLECTIONS - Manage collections
   // Actions: find, create, get_theme, set_theme, set_icon
   // ===========================================================================
@@ -1348,162 +1365,497 @@ const handlers: Record<string, ToolHandler> = {
   },
 
   // ===========================================================================
-  // 6. PRODUCTS - Manage products
-  // Actions: find, create, update, pricing_templates
+  // 6. PRODUCTS - Full product catalog management
+  // Products, categories, field schemas, pricing schemas, catalogs, assignments
   // ===========================================================================
   products: async (supabase, args, storeId) => {
     const action = args.action as string || "find";
+    const sid = storeId as string;
 
     try {
       switch (action) {
+
+        // ======================== PRODUCTS ========================
+
         case "find": {
-          const query = args.query as string || "";
-          const limit = (args.limit as number) || 200;
-          const statusFilter = args.status as string || "published";
-
-          // Split query into individual words for smarter matching
-          const words = query.trim().split(/\s+/).filter(Boolean);
-
-          // Separate words that might be category names vs product names
-          // Search categories first to find matching category IDs
-          let categoryIds: string[] = [];
-          if (words.length > 0) {
-            let catQ = supabase.from("categories").select("id, name");
-            if (storeId) catQ = catQ.eq("store_id", storeId);
-            // Match any word against category names
-            const catFilters = words.map(w => `name.ilike.%${w}%`).join(",");
-            catQ = catQ.or(catFilters);
-            const { data: matchingCats } = await catQ;
-            categoryIds = matchingCats?.map((c: Record<string, unknown>) => c.id as string) || [];
-          }
-
-          // Build product query with category join
-          let q = supabase
-            .from("products")
-            .select("id, name, sku, status, primary_category_id, category:categories!primary_category_id(name)")
+          const limit = args.limit as number || 25;
+          let q = supabase.from("products")
+            .select("id, name, sku, slug, status, type, cost_price, wholesale_price, stock_quantity, stock_status, featured, primary_category_id, pricing_schema_id, catalog_id, category:categories!primary_category_id(id, name), created_at, updated_at")
+            .order("created_at", { ascending: false })
             .limit(limit);
-
-          if (storeId) q = q.eq("store_id", storeId);
-          if (statusFilter !== "all") q = q.eq("status", statusFilter);
-
-          if (words.length > 0) {
-            // Build OR filter: match name words AND/OR category membership
-            const nameFilters = words.map(w => `name.ilike.%${w}%`);
-            const skuFilter = `sku.ilike.%${query}%`;
-            const allFilters = [...nameFilters, skuFilter];
-            if (categoryIds.length > 0) {
-              allFilters.push(`primary_category_id.in.(${categoryIds.join(",")})`);
+          if (sid) q = q.eq("store_id", sid);
+          if (args.query) q = q.or(`name.ilike.%${args.query}%,sku.ilike.%${args.query}%,description.ilike.%${args.query}%`);
+          if (args.category) {
+            const catVal = args.category as string;
+            if (/^[0-9a-f]{8}-/.test(catVal)) {
+              q = q.eq("primary_category_id", catVal);
+            } else {
+              let catQ = supabase.from("categories").select("id").ilike("name", `%${catVal}%`).limit(1);
+              if (sid) catQ = catQ.eq("store_id", sid);
+              const { data: cats } = await catQ;
+              if (cats?.length) q = q.eq("primary_category_id", cats[0].id);
             }
-            q = q.or(allFilters.join(","));
           }
-
+          if (args.catalog_id) q = q.eq("catalog_id", args.catalog_id as string);
+          if (args.status) q = q.eq("status", args.status as string);
+          if (args.featured !== undefined) q = q.eq("featured", args.featured as boolean);
           const { data, error } = await q;
-          if (error) return { success: false, error: error.message };
+          return error ? { success: false, error: error.message } : { success: true, count: data?.length, data };
+        }
 
-          // Score results: products matching MORE words rank higher
-          type ProductRow = Record<string, unknown>;
-          const scored = (data || []).map((p: ProductRow) => {
-            let score = 0;
-            const pName = ((p.name as string) || "").toLowerCase();
-            const catName = ((p.category as { name: string } | null)?.name || "").toLowerCase();
-            for (const w of words) {
-              const wl = w.toLowerCase();
-              if (pName.includes(wl)) score += 2;
-              if (catName.includes(wl)) score += 1;
-            }
-            return { product: p, score };
-          });
-          scored.sort((a, b) => b.score - a.score);
+        case "get": {
+          const pid = args.product_id as string;
+          const { data: product, error: pErr } = await supabase.from("products")
+            .select("*, category:categories!primary_category_id(id, name, slug)")
+            .eq("id", pid).single();
+          if (pErr) return { success: false, error: pErr.message };
 
-          // Enrich with inventory totals
-          const productIds = scored.map(s => s.product.id as string);
-          let inventoryMap: Record<string, number> = {};
-          if (productIds.length > 0) {
-            const { data: invData } = await supabase
-              .from("inventory")
-              .select("product_id, quantity")
-              .in("product_id", productIds)
-              .gt("quantity", 0);
-
-            if (invData) {
-              for (const inv of invData) {
-                inventoryMap[inv.product_id] = (inventoryMap[inv.product_id] || 0) + inv.quantity;
-              }
-            }
-          }
-
-          const enriched = scored.map(s => ({
-            id: s.product.id,
-            name: s.product.name,
-            sku: s.product.sku,
-            status: s.product.status,
-            category: (s.product.category as { name: string } | null)?.name || null,
-            total_stock: inventoryMap[s.product.id as string] || 0
-          }));
+          const { data: fieldSchemas } = await supabase.from("product_field_schemas")
+            .select("field_schema_id, field_schema:field_schemas!field_schema_id(id, name, fields, icon)")
+            .eq("product_id", pid);
+          const { data: pricingSchemas } = await supabase.from("product_pricing_schemas")
+            .select("pricing_schema_id, pricing_schema:pricing_schemas!pricing_schema_id(id, name, tiers, quality_tier)")
+            .eq("product_id", pid);
+          const { data: inventory } = await supabase.from("inventory")
+            .select("id, quantity, location:locations!location_id(id, name)")
+            .eq("product_id", pid).eq("store_id", sid);
 
           return {
             success: true,
-            data: enriched,
-            total_count: enriched.length,
-            limit,
-            truncated: enriched.length >= limit
+            data: {
+              ...product,
+              field_schemas: fieldSchemas?.map((fs: any) => fs.field_schema) || [],
+              pricing_schemas: pricingSchemas?.map((ps: any) => ps.pricing_schema) || [],
+              inventory: inventory || []
+            }
           };
         }
 
         case "create": {
-          const { data, error } = await supabase
-            .from("products")
-            .insert({
-              name: args.name,
-              sku: args.sku,
-              store_id: storeId
-            })
-            .select()
-            .single();
+          const name = args.name as string;
+          if (!name) return { success: false, error: "name is required" };
+          const insert: Record<string, unknown> = { store_id: sid, name };
+          if (args.sku) insert.sku = args.sku;
+          if (args.description) insert.description = args.description;
+          if (args.short_description) insert.short_description = args.short_description;
+          if (args.type) insert.type = args.type;
+          if (args.status) insert.status = args.status;
+          if (args.cost_price !== undefined) insert.cost_price = args.cost_price;
+          if (args.wholesale_price !== undefined) insert.wholesale_price = args.wholesale_price;
+          if (args.featured !== undefined) insert.featured = args.featured;
+          if (args.stock_quantity !== undefined) insert.stock_quantity = args.stock_quantity;
+          if (args.manage_stock !== undefined) insert.manage_stock = args.manage_stock;
+          if (args.weight !== undefined) insert.weight = args.weight;
+          if (args.tax_status) insert.tax_status = args.tax_status;
+          if (args.tax_class) insert.tax_class = args.tax_class;
+          if (args.catalog_id) insert.catalog_id = args.catalog_id;
+          if (args.pricing_data) insert.pricing_data = args.pricing_data;
+          if (args.field_values) insert.field_values = args.field_values;
+          if (args.is_wholesale !== undefined) insert.is_wholesale = args.is_wholesale;
+          if (args.wholesale_only !== undefined) insert.wholesale_only = args.wholesale_only;
+          if (args.minimum_wholesale_quantity !== undefined) insert.minimum_wholesale_quantity = args.minimum_wholesale_quantity;
+          if (args.category) {
+            const catVal = args.category as string;
+            if (/^[0-9a-f]{8}-/.test(catVal)) {
+              insert.primary_category_id = catVal;
+            } else {
+              let catQ = supabase.from("categories").select("id").ilike("name", `%${catVal}%`).limit(1);
+              if (sid) catQ = catQ.eq("store_id", sid);
+              const { data: cats } = await catQ;
+              if (cats?.length) insert.primary_category_id = cats[0].id;
+            }
+          }
+          if (args.pricing_schema_id) insert.pricing_schema_id = args.pricing_schema_id;
+
+          const { data, error } = await supabase.from("products").insert(insert)
+            .select("id, name, sku, slug, status, primary_category_id, pricing_schema_id, created_at").single();
           if (error) return { success: false, error: error.message };
+
+          if (args.field_schema_ids && Array.isArray(args.field_schema_ids)) {
+            const rows = (args.field_schema_ids as string[]).map(fsId => ({ product_id: data.id, field_schema_id: fsId }));
+            await supabase.from("product_field_schemas").insert(rows);
+          }
+          if (args.pricing_schema_ids && Array.isArray(args.pricing_schema_ids)) {
+            const rows = (args.pricing_schema_ids as string[]).map(psId => ({ product_id: data.id, pricing_schema_id: psId }));
+            await supabase.from("product_pricing_schemas").insert(rows);
+          }
           return { success: true, data };
         }
 
         case "update": {
-          const productId = args.product_id as string;
-          if (!productId) return { success: false, error: "product_id required" };
+          const pid = args.product_id as string;
+          if (!pid) return { success: false, error: "product_id is required" };
+          const updates: Record<string, unknown> = {};
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.sku !== undefined) updates.sku = args.sku;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.short_description !== undefined) updates.short_description = args.short_description;
+          if (args.type !== undefined) updates.type = args.type;
+          if (args.status !== undefined) updates.status = args.status;
+          if (args.cost_price !== undefined) updates.cost_price = args.cost_price;
+          if (args.wholesale_price !== undefined) updates.wholesale_price = args.wholesale_price;
+          if (args.featured !== undefined) updates.featured = args.featured;
+          if (args.stock_quantity !== undefined) updates.stock_quantity = args.stock_quantity;
+          if (args.manage_stock !== undefined) updates.manage_stock = args.manage_stock;
+          if (args.weight !== undefined) updates.weight = args.weight;
+          if (args.tax_status !== undefined) updates.tax_status = args.tax_status;
+          if (args.tax_class !== undefined) updates.tax_class = args.tax_class;
+          if (args.catalog_id !== undefined) updates.catalog_id = args.catalog_id;
+          if (args.pricing_schema_id !== undefined) updates.pricing_schema_id = args.pricing_schema_id;
+          if (args.pricing_data !== undefined) updates.pricing_data = args.pricing_data;
+          if (args.field_values !== undefined) updates.field_values = args.field_values;
+          if (args.is_wholesale !== undefined) updates.is_wholesale = args.is_wholesale;
+          if (args.wholesale_only !== undefined) updates.wholesale_only = args.wholesale_only;
+          if (args.minimum_wholesale_quantity !== undefined) updates.minimum_wholesale_quantity = args.minimum_wholesale_quantity;
+          if (args.featured_image !== undefined) updates.featured_image = args.featured_image;
+          if (args.category !== undefined) {
+            const catVal = args.category as string;
+            if (!catVal) { updates.primary_category_id = null; }
+            else if (/^[0-9a-f]{8}-/.test(catVal)) { updates.primary_category_id = catVal; }
+            else {
+              let catQ = supabase.from("categories").select("id").ilike("name", `%${catVal}%`).limit(1);
+              if (sid) catQ = catQ.eq("store_id", sid);
+              const { data: cats } = await catQ;
+              if (cats?.length) updates.primary_category_id = cats[0].id;
+            }
+          }
 
-          const updateData: Record<string, unknown> = {};
-          if (args.name) updateData.name = args.name;
-          if (args.sku) updateData.sku = args.sku;
-          if (args.status) updateData.status = args.status;
+          let q = supabase.from("products").update(updates).eq("id", pid);
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q.select("id, name, sku, slug, status, cost_price, pricing_schema_id, updated_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
 
-          const { data, error } = await supabase
-            .from("products")
-            .update(updateData)
-            .eq("id", productId)
-            .select()
-            .single();
+        case "delete": {
+          const pid = args.product_id as string;
+          if (!pid) return { success: false, error: "product_id is required" };
+          if (args.hard === true) {
+            let q = supabase.from("products").delete().eq("id", pid);
+            if (sid) q = q.eq("store_id", sid);
+            const { error } = await q;
+            return error ? { success: false, error: error.message } : { success: true, data: { id: pid, deleted: true } };
+          }
+          let q = supabase.from("products").update({ status: "archived" }).eq("id", pid);
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q.select("id, name, status").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        // ======================== CATEGORIES ========================
+
+        case "list_categories": {
+          let q = supabase.from("categories")
+            .select("id, name, slug, description, icon, parent_id, display_order, is_active, featured, product_count, catalog_id, field_schema_id, created_at")
+            .order("display_order", { ascending: true });
+          if (sid) q = q.eq("store_id", sid);
+          if (args.catalog_id) q = q.eq("catalog_id", args.catalog_id as string);
+          if (args.parent_id) q = q.eq("parent_id", args.parent_id as string);
+          if (args.active_only !== false) q = q.eq("is_active", true);
+          const { data, error } = await q.limit(args.limit as number || 100);
+          return error ? { success: false, error: error.message } : { success: true, count: data?.length, data };
+        }
+
+        case "get_category": {
+          const catId = args.category_id as string;
+          const { data: cat, error: catErr } = await supabase.from("categories").select("*").eq("id", catId).single();
+          if (catErr) return { success: false, error: catErr.message };
+
+          const { data: fieldAssigns } = await supabase.from("category_field_schemas")
+            .select("sort_order, is_active, field_schema:field_schemas!field_schema_id(id, name, fields, icon)")
+            .eq("category_id", catId).eq("is_active", true).order("sort_order");
+          const { data: pricingAssigns } = await supabase.from("category_pricing_schemas")
+            .select("sort_order, is_active, pricing_schema:pricing_schemas!pricing_schema_id(id, name, tiers, quality_tier)")
+            .eq("category_id", catId).eq("is_active", true).order("sort_order");
+          const { data: children } = await supabase.from("categories")
+            .select("id, name, slug, display_order, is_active, product_count")
+            .eq("parent_id", catId).order("display_order");
+
+          return {
+            success: true,
+            data: {
+              ...cat,
+              field_schemas: fieldAssigns?.map((a: any) => ({ ...a.field_schema, sort_order: a.sort_order })) || [],
+              pricing_schemas: pricingAssigns?.map((a: any) => ({ ...a.pricing_schema, sort_order: a.sort_order })) || [],
+              subcategories: children || []
+            }
+          };
+        }
+
+        case "create_category": {
+          const catName = args.name as string;
+          if (!catName) return { success: false, error: "name is required" };
+          const insert: Record<string, unknown> = { store_id: sid, name: catName, slug: catName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") };
+          if (args.description) insert.description = args.description;
+          if (args.icon) insert.icon = args.icon;
+          if (args.parent_id) insert.parent_id = args.parent_id;
+          if (args.catalog_id) insert.catalog_id = args.catalog_id;
+          if (args.display_order !== undefined) insert.display_order = args.display_order;
+          if (args.field_schema_id) insert.field_schema_id = args.field_schema_id;
+
+          const { data, error } = await supabase.from("categories").insert(insert)
+            .select("id, name, slug, parent_id, catalog_id, display_order, created_at").single();
           if (error) return { success: false, error: error.message };
+
+          if (args.field_schema_ids && Array.isArray(args.field_schema_ids)) {
+            const rows = (args.field_schema_ids as string[]).map((fsId, i) => ({ category_id: data.id, field_schema_id: fsId, sort_order: i + 1 }));
+            await supabase.from("category_field_schemas").insert(rows);
+          }
+          if (args.pricing_schema_ids && Array.isArray(args.pricing_schema_ids)) {
+            const rows = (args.pricing_schema_ids as string[]).map((psId, i) => ({ category_id: data.id, pricing_schema_id: psId, sort_order: i + 1 }));
+            await supabase.from("category_pricing_schemas").insert(rows);
+          }
           return { success: true, data };
         }
 
-        case "pricing_templates": {
-          // pricing_templates table may not exist - return empty array gracefully
-          try {
-            let q = supabase.from("pricing_templates").select("*");
-            if (storeId) q = q.eq("store_id", storeId);
-            const { data, error } = await q;
-            if (error) {
-              // Table doesn't exist - return empty array
-              if (error.message.includes("does not exist") || error.code === "42P01" || error.message.includes("schema cache")) {
-                return { success: true, data: [], message: "Pricing templates not configured" };
-              }
-              return { success: false, error: error.message };
-            }
-            return { success: true, data };
-          } catch {
-            return { success: true, data: [], message: "Pricing templates not configured" };
+        case "update_category": {
+          const catId = args.category_id as string;
+          if (!catId) return { success: false, error: "category_id is required" };
+          const updates: Record<string, unknown> = {};
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.icon !== undefined) updates.icon = args.icon;
+          if (args.parent_id !== undefined) updates.parent_id = args.parent_id;
+          if (args.catalog_id !== undefined) updates.catalog_id = args.catalog_id;
+          if (args.display_order !== undefined) updates.display_order = args.display_order;
+          if (args.is_active !== undefined) updates.is_active = args.is_active;
+          if (args.featured !== undefined) updates.featured = args.featured;
+          if (args.field_schema_id !== undefined) updates.field_schema_id = args.field_schema_id;
+
+          let q = supabase.from("categories").update(updates).eq("id", catId);
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q.select("id, name, slug, is_active, display_order, updated_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "delete_category": {
+          const catId = args.category_id as string;
+          if (!catId) return { success: false, error: "category_id is required" };
+          if (args.hard === true) {
+            let q = supabase.from("categories").delete().eq("id", catId);
+            if (sid) q = q.eq("store_id", sid);
+            const { error } = await q;
+            return error ? { success: false, error: error.message } : { success: true, data: { id: catId, deleted: true } };
           }
+          let q = supabase.from("categories").update({ is_active: false }).eq("id", catId);
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q.select("id, name, is_active").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        // ======================== FIELD SCHEMAS ========================
+
+        case "list_field_schemas": {
+          let q = supabase.from("field_schemas")
+            .select("id, name, slug, description, icon, fields, is_public, is_active, catalog_id, install_count, created_at")
+            .eq("is_active", true);
+          if (args.catalog_id) q = q.eq("catalog_id", args.catalog_id as string);
+          if (args.public_only === true) q = q.eq("is_public", true);
+          const { data, error } = await q.order("name").limit(args.limit as number || 50);
+          return error ? { success: false, error: error.message } : { success: true, count: data?.length, data };
+        }
+
+        case "get_field_schema": {
+          const fsId = args.field_schema_id as string;
+          const { data, error } = await supabase.from("field_schemas").select("*").eq("id", fsId).single();
+          if (error) return { success: false, error: error.message };
+          const { data: assignments } = await supabase.from("category_field_schemas")
+            .select("category:categories!category_id(id, name)").eq("field_schema_id", fsId).eq("is_active", true);
+          return { success: true, data: { ...data, assigned_categories: assignments?.map((a: any) => a.category) || [] } };
+        }
+
+        case "create_field_schema": {
+          const fsName = args.name as string;
+          if (!fsName) return { success: false, error: "name is required" };
+          if (!args.fields || !Array.isArray(args.fields)) return { success: false, error: "fields array is required" };
+          const insert: Record<string, unknown> = {
+            name: fsName, slug: fsName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+            fields: args.fields
+          };
+          if (args.description) insert.description = args.description;
+          if (args.icon) insert.icon = args.icon;
+          if (args.catalog_id) insert.catalog_id = args.catalog_id;
+          if (args.is_public !== undefined) insert.is_public = args.is_public;
+          const { data, error } = await supabase.from("field_schemas").insert(insert)
+            .select("id, name, slug, fields, icon, is_active, created_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "update_field_schema": {
+          const fsId = args.field_schema_id as string;
+          if (!fsId) return { success: false, error: "field_schema_id is required" };
+          const updates: Record<string, unknown> = {};
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.icon !== undefined) updates.icon = args.icon;
+          if (args.fields !== undefined) updates.fields = args.fields;
+          if (args.is_public !== undefined) updates.is_public = args.is_public;
+          if (args.is_active !== undefined) updates.is_active = args.is_active;
+          if (args.catalog_id !== undefined) updates.catalog_id = args.catalog_id;
+          const { data, error } = await supabase.from("field_schemas").update(updates).eq("id", fsId)
+            .select("id, name, slug, fields, icon, is_active, updated_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "delete_field_schema": {
+          const fsId = args.field_schema_id as string;
+          if (!fsId) return { success: false, error: "field_schema_id is required" };
+          const { data, error } = await supabase.from("field_schemas")
+            .update({ is_active: false, deleted_at: new Date().toISOString() }).eq("id", fsId)
+            .select("id, name, is_active").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        // ======================== PRICING SCHEMAS ========================
+
+        case "list_pricing_schemas": {
+          let q = supabase.from("pricing_schemas")
+            .select("id, name, slug, description, tiers, quality_tier, is_public, is_active, catalog_id, install_count, created_at")
+            .eq("is_active", true);
+          if (args.catalog_id) q = q.eq("catalog_id", args.catalog_id as string);
+          if (args.public_only === true) q = q.eq("is_public", true);
+          const { data, error } = await q.order("name").limit(args.limit as number || 50);
+          return error ? { success: false, error: error.message } : { success: true, count: data?.length, data };
+        }
+
+        case "get_pricing_schema": {
+          const psId = args.pricing_schema_id as string;
+          const { data, error } = await supabase.from("pricing_schemas").select("*").eq("id", psId).single();
+          if (error) return { success: false, error: error.message };
+          const { data: assignments } = await supabase.from("category_pricing_schemas")
+            .select("category:categories!category_id(id, name)").eq("pricing_schema_id", psId).eq("is_active", true);
+          return { success: true, data: { ...data, assigned_categories: assignments?.map((a: any) => a.category) || [] } };
+        }
+
+        case "create_pricing_schema": {
+          const psName = args.name as string;
+          if (!psName) return { success: false, error: "name is required" };
+          if (!args.tiers || !Array.isArray(args.tiers)) return { success: false, error: "tiers array is required" };
+          const insert: Record<string, unknown> = {
+            name: psName, slug: psName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+            tiers: args.tiers
+          };
+          if (args.description) insert.description = args.description;
+          if (args.quality_tier) insert.quality_tier = args.quality_tier;
+          if (args.catalog_id) insert.catalog_id = args.catalog_id;
+          if (args.is_public !== undefined) insert.is_public = args.is_public;
+          const { data, error } = await supabase.from("pricing_schemas").insert(insert)
+            .select("id, name, slug, tiers, quality_tier, is_active, created_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "update_pricing_schema": {
+          const psId = args.pricing_schema_id as string;
+          if (!psId) return { success: false, error: "pricing_schema_id is required" };
+          const updates: Record<string, unknown> = {};
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.tiers !== undefined) updates.tiers = args.tiers;
+          if (args.quality_tier !== undefined) updates.quality_tier = args.quality_tier;
+          if (args.is_public !== undefined) updates.is_public = args.is_public;
+          if (args.is_active !== undefined) updates.is_active = args.is_active;
+          if (args.catalog_id !== undefined) updates.catalog_id = args.catalog_id;
+          const { data, error } = await supabase.from("pricing_schemas").update(updates).eq("id", psId)
+            .select("id, name, slug, tiers, quality_tier, is_active, updated_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "delete_pricing_schema": {
+          const psId = args.pricing_schema_id as string;
+          if (!psId) return { success: false, error: "pricing_schema_id is required" };
+          const { data, error } = await supabase.from("pricing_schemas")
+            .update({ is_active: false, deleted_at: new Date().toISOString() }).eq("id", psId)
+            .select("id, name, is_active").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        // ======================== CATALOGS ========================
+
+        case "list_catalogs": {
+          let q = supabase.from("catalogs")
+            .select("id, name, slug, description, vertical, is_active, is_default, display_order, created_at")
+            .order("display_order");
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q;
+          return error ? { success: false, error: error.message } : { success: true, count: data?.length, data };
+        }
+
+        case "create_catalog": {
+          const catName = args.name as string;
+          if (!catName) return { success: false, error: "name is required" };
+          // Resolve owner_user_id from store
+          const { data: store } = await supabase.from("stores").select("owner_user_id").eq("id", sid).single();
+          const insert: Record<string, unknown> = {
+            store_id: sid, name: catName,
+            slug: catName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+            owner_user_id: store?.owner_user_id
+          };
+          if (args.description) insert.description = args.description;
+          if (args.vertical) insert.vertical = args.vertical;
+          if (args.is_default !== undefined) insert.is_default = args.is_default;
+          if (args.settings) insert.settings = args.settings;
+          const { data, error } = await supabase.from("catalogs").insert(insert)
+            .select("id, name, slug, vertical, is_default, created_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "update_catalog": {
+          const catalogId = args.catalog_id as string;
+          if (!catalogId) return { success: false, error: "catalog_id is required" };
+          const updates: Record<string, unknown> = {};
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.vertical !== undefined) updates.vertical = args.vertical;
+          if (args.is_active !== undefined) updates.is_active = args.is_active;
+          if (args.is_default !== undefined) updates.is_default = args.is_default;
+          if (args.settings !== undefined) updates.settings = args.settings;
+          if (args.display_order !== undefined) updates.display_order = args.display_order;
+
+          let q = supabase.from("catalogs").update(updates).eq("id", catalogId);
+          if (sid) q = q.eq("store_id", sid);
+          const { data, error } = await q.select("id, name, slug, vertical, is_active, is_default, updated_at").single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        // ======================== SCHEMA ASSIGNMENTS ========================
+
+        case "assign_schema": {
+          const target = args.target as string;
+          const schemaType = args.schema_type as string;
+          const targetId = args.target_id as string;
+          const schemaId = args.schema_id as string;
+          if (!target || !schemaType || !targetId || !schemaId) {
+            return { success: false, error: "target (category|product), schema_type (field|pricing), target_id, and schema_id are required" };
+          }
+          const table = target === "product"
+            ? (schemaType === "field" ? "product_field_schemas" : "product_pricing_schemas")
+            : (schemaType === "field" ? "category_field_schemas" : "category_pricing_schemas");
+          const fkCol = target === "product" ? "product_id" : "category_id";
+          const schemaCol = schemaType === "field" ? "field_schema_id" : "pricing_schema_id";
+          const row: Record<string, unknown> = { [fkCol]: targetId, [schemaCol]: schemaId };
+          if (args.sort_order !== undefined) row.sort_order = args.sort_order;
+          const { data, error } = await supabase.from(table).upsert(row, { onConflict: `${fkCol},${schemaCol}` }).select().single();
+          return error ? { success: false, error: error.message } : { success: true, data };
+        }
+
+        case "unassign_schema": {
+          const target = args.target as string;
+          const schemaType = args.schema_type as string;
+          const targetId = args.target_id as string;
+          const schemaId = args.schema_id as string;
+          if (!target || !schemaType || !targetId || !schemaId) {
+            return { success: false, error: "target (category|product), schema_type (field|pricing), target_id, and schema_id are required" };
+          }
+          const table = target === "product"
+            ? (schemaType === "field" ? "product_field_schemas" : "product_pricing_schemas")
+            : (schemaType === "field" ? "category_field_schemas" : "category_pricing_schemas");
+          const fkCol = target === "product" ? "product_id" : "category_id";
+          const schemaCol = schemaType === "field" ? "field_schema_id" : "pricing_schema_id";
+          const { error } = await supabase.from(table).delete().eq(fkCol, targetId).eq(schemaCol, schemaId);
+          return error ? { success: false, error: error.message } : { success: true, data: { removed: true, target, schema_type: schemaType, target_id: targetId, schema_id: schemaId } };
         }
 
         default:
-          return { success: false, error: `Unknown action: ${action}. Use: find, create, update, pricing_templates` };
+          return { success: false, error: `Unknown products action: ${action}` };
       }
     } catch (err) {
       return { success: false, error: `Products error: ${err}` };
@@ -2086,6 +2438,38 @@ const handlers: Record<string, ToolHandler> = {
   },
 
   // ===========================================================================
+  // 8b. STORE_INFO - Get store branding, logo, colors, contact info
+  // ===========================================================================
+  store_info: async (supabase, _args, storeId) => {
+    if (!storeId) return { success: false, error: "store_id required" };
+
+    try {
+      const { data, error } = await supabase
+        .from("stores")
+        .select("id, store_name, slug, store_tagline, store_description, logo_url, banner_url, brand_colors, social_links, email, phone, city, state, business_hours, ecommerce_url")
+        .eq("id", storeId)
+        .single();
+
+      if (error) return { success: false, error: error.message };
+
+      // Parse JSON string fields if needed
+      if (data.brand_colors && typeof data.brand_colors === "string") {
+        try { data.brand_colors = JSON.parse(data.brand_colors); } catch {}
+      }
+      if (data.social_links && typeof data.social_links === "string") {
+        try { data.social_links = JSON.parse(data.social_links); } catch {}
+      }
+      if (data.business_hours && typeof data.business_hours === "string") {
+        try { data.business_hours = JSON.parse(data.business_hours); } catch {}
+      }
+
+      return { success: true, data };
+    } catch (err) {
+      return { success: false, error: `Store info error: ${err}` };
+    }
+  },
+
+  // ===========================================================================
   // 9. ORDERS - Manage orders
   // Actions: find, get, create
   // ===========================================================================
@@ -2233,17 +2617,21 @@ const handlers: Record<string, ToolHandler> = {
           const emailId = args.email_id as string;
           if (!emailId) return { success: false, error: "get requires email_id" };
 
-          const { data, error } = await supabase.from("email_sends").select("*").eq("id", emailId).single();
+          let getQ = supabase.from("email_sends").select("*").eq("id", emailId);
+          if (storeId) getQ = getQ.eq("store_id", storeId);
+          const { data, error } = await getQ.single();
           if (error) return { success: false, error: error.message };
           return { success: true, data };
         }
 
         case "templates": {
-          const { data, error } = await supabase
+          let tplQ = supabase
             .from("email_templates")
             .select("id, name, slug, subject, description, category, is_active")
             .eq("is_active", true);
+          if (storeId) tplQ = tplQ.eq("store_id", storeId);
 
+          const { data, error } = await tplQ;
           if (error) return { success: false, error: error.message };
           return { success: true, data };
         }
@@ -2285,16 +2673,17 @@ const handlers: Record<string, ToolHandler> = {
           const threadId = args.thread_id as string;
           if (!threadId) return { success: false, error: "inbox_get requires thread_id" };
 
-          // Fetch thread
-          const { data: thread, error: threadError } = await supabase
+          // Fetch thread — enforce store isolation
+          let threadQ = supabase
             .from("email_threads")
             .select(`
               *,
               customer:customers(id, first_name, last_name, email, phone),
               order:orders(id, order_number, status, total, created_at)
             `)
-            .eq("id", threadId)
-            .single();
+            .eq("id", threadId);
+          if (storeId) threadQ = threadQ.eq("store_id", storeId);
+          const { data: thread, error: threadError } = await threadQ.single();
 
           if (threadError) return { success: false, error: threadError.message };
 
@@ -2336,12 +2725,13 @@ const handlers: Record<string, ToolHandler> = {
           if (!threadId) return { success: false, error: "inbox_reply requires thread_id" };
           if (!html && !text) return { success: false, error: "inbox_reply requires html or text body" };
 
-          // Get thread + last inbound message for threading
-          const { data: thread } = await supabase
+          // Get thread + last inbound message for threading — enforce store isolation
+          let replyThreadQ = supabase
             .from("email_threads")
             .select("id, subject, customer:customers(email)")
-            .eq("id", threadId)
-            .single();
+            .eq("id", threadId);
+          if (storeId) replyThreadQ = replyThreadQ.eq("store_id", storeId);
+          const { data: thread } = await replyThreadQ.single();
 
           if (!thread) return { success: false, error: "Thread not found" };
 
@@ -2387,10 +2777,12 @@ const handlers: Record<string, ToolHandler> = {
           if (args.intent) updates.intent = args.intent;
           if (args.ai_summary) updates.ai_summary = args.ai_summary;
 
-          const { data, error } = await supabase
+          let updateQ = supabase
             .from("email_threads")
             .update(updates)
-            .eq("id", threadId)
+            .eq("id", threadId);
+          if (storeId) updateQ = updateQ.eq("store_id", storeId);
+          const { data, error } = await updateQ
             .select("id, status, priority, intent, ai_summary")
             .single();
 
@@ -2532,12 +2924,13 @@ const handlers: Record<string, ToolHandler> = {
           const domainId = args.domain_id as string;
           if (!domainId) return { success: false, error: "domain_id required" };
 
-          // Get domain record
-          const { data: domainRecord, error: fetchError } = await supabase
+          // Get domain record — enforce store isolation
+          let domQ = supabase
             .from("store_email_domains")
             .select("*")
-            .eq("id", domainId)
-            .single();
+            .eq("id", domainId);
+          if (storeId) domQ = domQ.eq("store_id", storeId);
+          const { data: domainRecord, error: fetchError } = await domQ.single();
 
           if (fetchError || !domainRecord) {
             return { success: false, error: "Domain not found" };
@@ -2658,8 +3051,104 @@ const handlers: Record<string, ToolHandler> = {
           };
         }
 
+        // =====================================================================
+        // TEMPLATE CRUD - Create, update, delete email templates
+        // =====================================================================
+
+        case "create_template": {
+          const name = args.name as string;
+          const slug = args.slug as string;
+          const tplSubject = args.subject as string;
+          const htmlContent = args.html_content as string;
+          const textContent = args.text_content as string;
+
+          if (!name || !slug || !tplSubject) {
+            return { success: false, error: "create_template requires: name, slug, subject" };
+          }
+          if (!htmlContent && !textContent) {
+            return { success: false, error: "create_template requires: html_content or text_content" };
+          }
+
+          // Check slug uniqueness per store
+          let slugCheck = supabase
+            .from("email_templates")
+            .select("id")
+            .eq("slug", slug)
+            .eq("is_active", true);
+          if (storeId) slugCheck = slugCheck.eq("store_id", storeId);
+          const { data: existing } = await slugCheck;
+          if (existing && existing.length > 0) {
+            return { success: false, error: `Template with slug "${slug}" already exists` };
+          }
+
+          const record: Record<string, unknown> = {
+            name,
+            slug,
+            subject: tplSubject,
+            is_active: true,
+          };
+          if (htmlContent) record.html_content = htmlContent;
+          if (textContent) record.text_content = textContent;
+          if (args.description) record.description = args.description;
+          if (args.category) record.category = args.category;
+          if (storeId) record.store_id = storeId;
+
+          const { data: created, error: createErr } = await supabase
+            .from("email_templates")
+            .insert(record)
+            .select("id, name, slug, subject, description, category, is_active, created_at")
+            .single();
+
+          if (createErr) return { success: false, error: createErr.message };
+          return { success: true, data: created };
+        }
+
+        case "update_template": {
+          const templateId = args.template_id as string;
+          if (!templateId) return { success: false, error: "update_template requires template_id" };
+
+          const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+          if (args.name !== undefined) updates.name = args.name;
+          if (args.slug !== undefined) updates.slug = args.slug;
+          if (args.subject !== undefined) updates.subject = args.subject;
+          if (args.html_content !== undefined) updates.html_content = args.html_content;
+          if (args.text_content !== undefined) updates.text_content = args.text_content;
+          if (args.description !== undefined) updates.description = args.description;
+          if (args.category !== undefined) updates.category = args.category;
+          if (args.is_active !== undefined) updates.is_active = args.is_active;
+
+          let updateQ = supabase
+            .from("email_templates")
+            .update(updates)
+            .eq("id", templateId);
+          if (storeId) updateQ = updateQ.eq("store_id", storeId);
+          const { data: updated, error: updateErr } = await updateQ
+            .select("id, name, slug, subject, description, category, is_active")
+            .single();
+
+          if (updateErr) return { success: false, error: updateErr.message };
+          return { success: true, data: updated };
+        }
+
+        case "delete_template": {
+          const templateId = args.template_id as string;
+          if (!templateId) return { success: false, error: "delete_template requires template_id" };
+
+          let deleteQ = supabase
+            .from("email_templates")
+            .update({ is_active: false, updated_at: new Date().toISOString() })
+            .eq("id", templateId);
+          if (storeId) deleteQ = deleteQ.eq("store_id", storeId);
+          const { data: deleted, error: deleteErr } = await deleteQ
+            .select("id, name, slug, is_active")
+            .single();
+
+          if (deleteErr) return { success: false, error: deleteErr.message };
+          return { success: true, data: deleted };
+        }
+
         default:
-          return { success: false, error: `Unknown action: ${action}. Use: send, send_template, list, get, templates, inbox, inbox_get, inbox_reply, inbox_update, inbox_stats, domains_list, domains_add, domains_verify, addresses_list, addresses_add` };
+          return { success: false, error: `Unknown action: ${action}. Use: send, send_template, list, get, templates, create_template, update_template, delete_template, inbox, inbox_get, inbox_reply, inbox_update, inbox_stats, domains_list, domains_add, domains_verify, addresses_list, addresses_add` };
       }
     } catch (err) {
       return { success: false, error: `Email error: ${err}` };
@@ -2696,17 +3185,21 @@ const handlers: Record<string, ToolHandler> = {
   // ===========================================================================
   alerts: async (supabase, args, storeId) => {
     try {
-      const { data: lowStock } = await supabase
+      let stockQ = supabase
         .from("inventory")
         .select("product_id, quantity, products(name)")
         .lt("quantity", 10)
         .limit(20);
+      if (storeId) stockQ = stockQ.eq("store_id", storeId);
+      const { data: lowStock } = await stockQ;
 
-      const { data: pendingOrders } = await supabase
+      let orderQ = supabase
         .from("orders")
         .select("id, order_number")
         .eq("status", "pending")
         .limit(20);
+      if (storeId) orderQ = orderQ.eq("store_id", storeId);
+      const { data: pendingOrders } = await orderQ;
 
       return {
         success: true,
@@ -2978,6 +3471,275 @@ const handlers: Record<string, ToolHandler> = {
       return { success: false, error: `Audit trail error: ${err}` };
     }
   },
+
+  // ===========================================================================
+  // 18. TELEMETRY — AI system observability (conversations, traces, costs)
+  // ===========================================================================
+  telemetry: async (supabase, args, storeId) => {
+    try {
+      const action = args.action as string;
+      if (!action) return { success: false, error: "action required: conversations, conversation_detail, agent_performance, tool_analytics, tool_timeline, trace, span_detail, error_patterns, token_usage, sources" };
+
+      const limit = (args.limit as number) || 25;
+      const hoursBack = (args.hours_back as number) || 24;
+      const days = (args.days as number) || 7;
+      const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
+      const daysSince = new Date(Date.now() - days * 86400000).toISOString();
+
+      switch (action) {
+        case "conversations": {
+          let q = supabase
+            .from("audit_logs")
+            .select("conversation_id, action, created_at, details")
+            .gte("created_at", since)
+            .like("action", "api.%")
+            .order("created_at", { ascending: false })
+            .limit(500);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (args.agent_id) q = q.eq("details->>agent_id", args.agent_id as string);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          // Group by conversation_id
+          const convos: Record<string, { messages: number; first: string; last: string; model?: string }> = {};
+          for (const r of (data || []) as any[]) {
+            const cid = r.conversation_id || "unknown";
+            if (!convos[cid]) convos[cid] = { messages: 0, first: r.created_at, last: r.created_at, model: r.details?.["gen_ai.request.model"] };
+            convos[cid].messages++;
+            if (r.created_at < convos[cid].first) convos[cid].first = r.created_at;
+            if (r.created_at > convos[cid].last) convos[cid].last = r.created_at;
+          }
+          const sorted = Object.entries(convos)
+            .sort(([, a], [, b]) => b.last.localeCompare(a.last))
+            .slice(0, limit)
+            .map(([id, v]) => ({ conversation_id: id, ...v }));
+          return { success: true, data: { action: "conversations", hours_back: hoursBack, conversations: sorted } };
+        }
+
+        case "conversation_detail": {
+          const cid = args.conversation_id as string;
+          if (!cid) return { success: false, error: "conversation_id required" };
+          const { data, error } = await supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, input_tokens, output_tokens, error_message, details, created_at")
+            .eq("conversation_id", cid)
+            .order("created_at", { ascending: true })
+            .limit(200);
+          if (error) return { success: false, error: error.message };
+          return { success: true, data: { action: "conversation_detail", conversation_id: cid, entries: data } };
+        }
+
+        case "agent_performance": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, error_message, created_at")
+            .gte("created_at", daysSince)
+            .order("created_at", { ascending: false })
+            .limit(1000);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (args.agent_id) q = q.eq("details->>agent_id", args.agent_id as string);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          let total = 0, errors = 0, totalMs = 0;
+          for (const r of (data || []) as any[]) {
+            total++;
+            if (r.status_code === "ERROR") errors++;
+            totalMs += r.duration_ms || 0;
+          }
+          return {
+            success: true,
+            data: {
+              action: "agent_performance", days,
+              total_calls: total, errors, success_rate: total ? `${(((total - errors) / total) * 100).toFixed(1)}%` : "N/A",
+              avg_duration_ms: total ? Math.round(totalMs / total) : 0,
+            },
+          };
+        }
+
+        case "tool_analytics": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, created_at")
+            .gte("created_at", since)
+            .like("action", "tool.%")
+            .order("created_at", { ascending: false })
+            .limit(1000);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (args.tool_name) q = q.eq("action", `tool.${args.tool_name}`);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          const stats: Record<string, { calls: number; errors: number; total_ms: number }> = {};
+          for (const r of (data || []) as any[]) {
+            const tool = r.action.replace("tool.", "");
+            if (!stats[tool]) stats[tool] = { calls: 0, errors: 0, total_ms: 0 };
+            stats[tool].calls++;
+            if (r.status_code === "ERROR") stats[tool].errors++;
+            stats[tool].total_ms += r.duration_ms || 0;
+          }
+          const toolStats = Object.fromEntries(
+            Object.entries(stats)
+              .sort(([, a], [, b]) => b.calls - a.calls)
+              .slice(0, limit)
+              .map(([k, v]) => [k, { ...v, avg_ms: Math.round(v.total_ms / v.calls) }])
+          );
+          return { success: true, data: { action: "tool_analytics", hours_back: hoursBack, tools: toolStats } };
+        }
+
+        case "tool_timeline": {
+          const bucketMin = (args.bucket_minutes as number) || 15;
+          let q = supabase
+            .from("audit_logs")
+            .select("action, created_at")
+            .gte("created_at", since)
+            .like("action", "tool.%")
+            .order("created_at", { ascending: true })
+            .limit(2000);
+          if (storeId) q = q.eq("store_id", storeId);
+          if (args.tool_name) q = q.eq("action", `tool.${args.tool_name}`);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          // Bucket by time intervals
+          const buckets: Record<string, number> = {};
+          for (const r of (data || []) as any[]) {
+            const t = new Date(r.created_at);
+            const mins = Math.floor(t.getMinutes() / bucketMin) * bucketMin;
+            t.setMinutes(mins, 0, 0);
+            const key = t.toISOString();
+            buckets[key] = (buckets[key] || 0) + 1;
+          }
+          const timeline = Object.entries(buckets).map(([time, count]) => ({ time, count }));
+          return { success: true, data: { action: "tool_timeline", bucket_minutes: bucketMin, hours_back: hoursBack, timeline } };
+        }
+
+        case "trace": {
+          const traceId = args.trace_id as string;
+          if (!traceId) return { success: false, error: "trace_id required" };
+          const { data, error } = await supabase
+            .from("audit_logs")
+            .select("action, status_code, duration_ms, details, created_at")
+            .eq("trace_id", traceId)
+            .order("created_at", { ascending: true });
+          if (error) return { success: false, error: error.message };
+          return { success: true, data: { action: "trace", trace_id: traceId, spans: data } };
+        }
+
+        case "span_detail": {
+          const spanId = args.span_id as string;
+          if (!spanId) return { success: false, error: "span_id required" };
+          const { data, error } = await supabase
+            .from("audit_logs")
+            .select("*")
+            .eq("span_id", spanId)
+            .single();
+          if (error) return { success: false, error: error.message };
+          return { success: true, data: { action: "span_detail", span: data } };
+        }
+
+        case "error_patterns": {
+          let q = supabase
+            .from("audit_logs")
+            .select("action, error_message, status_code, details, created_at")
+            .gte("created_at", since)
+            .eq("status_code", "ERROR")
+            .order("created_at", { ascending: false })
+            .limit(500);
+          if (storeId) q = q.eq("store_id", storeId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          // Group by error pattern
+          const patterns: Record<string, { count: number; actions: string[]; last_seen: string; sample: string }> = {};
+          for (const r of (data || []) as any[]) {
+            const errMsg = (r.error_message || "Unknown error").slice(0, 100);
+            if (!patterns[errMsg]) patterns[errMsg] = { count: 0, actions: [], last_seen: r.created_at, sample: r.error_message || "" };
+            patterns[errMsg].count++;
+            if (!patterns[errMsg].actions.includes(r.action)) patterns[errMsg].actions.push(r.action);
+          }
+          const sorted = Object.entries(patterns)
+            .sort(([, a], [, b]) => b.count - a.count)
+            .slice(0, limit)
+            .map(([pattern, v]) => ({ pattern, ...v }));
+          return { success: true, data: { action: "error_patterns", hours_back: hoursBack, total_errors: (data || []).length, patterns: sorted } };
+        }
+
+        case "token_usage": {
+          let q = supabase
+            .from("audit_logs")
+            .select("input_tokens, output_tokens, details, created_at")
+            .gte("created_at", daysSince)
+            .not("input_tokens", "is", null)
+            .order("created_at", { ascending: false })
+            .limit(2000);
+          if (storeId) q = q.eq("store_id", storeId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          // Group by day and model
+          const byDay: Record<string, { input: number; output: number; calls: number }> = {};
+          const byModel: Record<string, { input: number; output: number; calls: number }> = {};
+          for (const r of (data || []) as any[]) {
+            const day = r.created_at.slice(0, 10);
+            const model = r.details?.["gen_ai.request.model"] || "unknown";
+            if (!byDay[day]) byDay[day] = { input: 0, output: 0, calls: 0 };
+            byDay[day].input += r.input_tokens || 0;
+            byDay[day].output += r.output_tokens || 0;
+            byDay[day].calls++;
+            if (!byModel[model]) byModel[model] = { input: 0, output: 0, calls: 0 };
+            byModel[model].input += r.input_tokens || 0;
+            byModel[model].output += r.output_tokens || 0;
+            byModel[model].calls++;
+          }
+          // Estimate cost per model
+          const pricing: Record<string, [number, number]> = {
+            "claude-sonnet-4-20250514": [3, 15],
+            "claude-opus-4-6": [15, 75],
+            "claude-haiku-4-5-20251001": [1, 5],
+          };
+          const modelCosts = Object.fromEntries(
+            Object.entries(byModel).map(([model, v]) => {
+              const [inRate, outRate] = pricing[model] || [3, 15];
+              const cost = (v.input / 1_000_000) * inRate + (v.output / 1_000_000) * outRate;
+              return [model, { ...v, total_tokens: v.input + v.output, estimated_cost_usd: `$${cost.toFixed(4)}` }];
+            })
+          );
+          return { success: true, data: { action: "token_usage", days, by_day: byDay, by_model: modelCosts } };
+        }
+
+        case "sources": {
+          let q = supabase
+            .from("audit_logs")
+            .select("source, action, status_code, created_at")
+            .gte("created_at", since)
+            .order("created_at", { ascending: false })
+            .limit(1000);
+          if (storeId) q = q.eq("store_id", storeId);
+          const { data, error } = await q;
+          if (error) return { success: false, error: error.message };
+
+          const bySrc: Record<string, { calls: number; errors: number; actions: Set<string> }> = {};
+          for (const r of (data || []) as any[]) {
+            const src = r.source || "unknown";
+            if (!bySrc[src]) bySrc[src] = { calls: 0, errors: 0, actions: new Set() };
+            bySrc[src].calls++;
+            if (r.status_code === "ERROR") bySrc[src].errors++;
+            bySrc[src].actions.add(r.action);
+          }
+          const sources = Object.fromEntries(
+            Object.entries(bySrc).map(([k, v]) => [k, { calls: v.calls, errors: v.errors, unique_actions: v.actions.size }])
+          );
+          return { success: true, data: { action: "sources", hours_back: hoursBack, sources } };
+        }
+
+        default:
+          return { success: false, error: `Unknown telemetry action: ${action}. Use: conversations, conversation_detail, agent_performance, tool_analytics, tool_timeline, trace, span_detail, error_patterns, token_usage, sources` };
+      }
+    } catch (err) {
+      return { success: false, error: `Telemetry error: ${err}` };
+    }
+  },
 };
 
 // ============================================================================
@@ -3023,6 +3785,10 @@ export interface ExecutionContext {
   // Cost isolation: marginal cost of the API turn that triggered this tool
   costBefore?: number;     // Cumulative cost before this tool's API turn
   turnCost?: number;       // Cost of the specific API turn that invoked this tool
+
+  // Agent-loop context (enriches executor telemetry when called from CLI)
+  iteration?: number;      // Agent loop iteration number
+  toolType?: string;       // "server" | "local" | "interactive"
 }
 
 // Generate W3C-compliant span ID (16 hex chars)
@@ -3141,6 +3907,11 @@ async function logToolExecution(
         error_type: result.errorType || null,
         retryable: result.retryable ?? false,
 
+        // Agent-loop context (when called from CLI)
+        iteration: context?.iteration ?? null,
+        tool_type: context?.toolType || null,
+        parent_span_id: context?.parentSpanId || null,
+
         // Legacy/backwards compatibility
         args: sanitizedArgs,
         result: result.success ? result.data : null,
@@ -3212,7 +3983,6 @@ export async function executeTool(
       retryable: false
     };
 
-    // Log failed tool lookup with OTEL fields
     await logToolExecution(supabase, toolName, action, args, result, Date.now() - startTime, storeId, context, startDate);
     return result;
   }

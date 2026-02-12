@@ -39,6 +39,9 @@ import { getGlobalEmitter } from "./agent-events.js";
 import { getValidToken, SUPABASE_URL, createAuthenticatedClient } from "./auth-service.js";
 import { resolveConfig } from "./config-store.js";
 import { executeLSP, notifyFileChanged } from "./lsp-manager.js";
+import { sandboxCommand, cleanupSandbox } from "./sandbox.js";
+import { backupFile } from "./file-history.js";
+import { debugLog } from "./debug-log.js";
 // Lazy import to avoid circular dependency — agent-loop imports local-tools
 let _agentLoopExports: {
   setPermissionMode: (mode: "default" | "plan" | "yolo") => { success: boolean; message: string };
@@ -137,6 +140,8 @@ export const LOCAL_TOOL_NAMES = new Set([
   "ask_user", // Structured questions
   // Code intelligence
   "lsp",
+  // Skills
+  "skill",
 ]);
 
 export function isLocalTool(name: string): boolean {
@@ -239,6 +244,7 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
         timeout: { type: "number", description: "Timeout in milliseconds (default 30000, max 300000)" },
         description: { type: "string", description: "Short description of what this command does" },
         run_in_background: { type: "boolean", description: "Run in background (for dev servers, watchers). Returns process ID immediately." },
+        dangerouslyDisableSandbox: { type: "boolean", description: "Disable OS-level sandbox for this command (default: sandboxed)" },
       },
       required: ["command"],
     },
@@ -636,6 +642,22 @@ export const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
       required: ["question", "options"],
     },
   },
+
+  // ------------------------------------------------------------------
+  // SKILL — invoke named skills (model-callable)
+  // ------------------------------------------------------------------
+  {
+    name: "skill",
+    description: "Invoke a named skill. Skills provide specialized workflows like committing code, reviewing PRs, etc. Built-in skills: commit, review, review-pr. Custom skills from .whale/commands/ and ~/.swagmanager/commands/.",
+    input_schema: {
+      type: "object",
+      properties: {
+        skill: { type: "string", description: "Skill name (e.g., 'commit', 'review-pr')" },
+        args: { type: "string", description: "Optional arguments for the skill" },
+      },
+      required: ["skill"],
+    },
+  },
 ];
 
 // ============================================================================
@@ -685,6 +707,7 @@ export async function executeLocalTool(
       case "config":          return await configTool(input);
       case "ask_user":        return askUser(input);
       case "lsp":             return await lspTool(input);
+      case "skill":           return skillTool(input);
       default:                return { success: false, output: `Unknown local tool: ${name}` };
     }
   } catch (err) {
@@ -857,9 +880,11 @@ function writeFile(input: Record<string, unknown>): ToolResult {
   const content = input.content as string;
   const existed = existsSync(path);
   const oldContent = existed ? readFileSync(path, "utf-8") : null;
+  backupFile(path); // Save backup before modification
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, content, "utf-8");
+  debugLog("tools", `write_file: ${path} (${content.length} chars)`);
   notifyFileChanged(path);
 
   const newLines = content.split("\n");
@@ -900,6 +925,7 @@ function editFile(input: Record<string, unknown>): ToolResult {
   const replaceAll = (input.replace_all as boolean) ?? false;
 
   if (!existsSync(path)) return { success: false, output: `File not found: ${path}` };
+  backupFile(path); // Save backup before modification
   let content = readFileSync(path, "utf-8");
   if (!content.includes(oldString)) return { success: false, output: "old_string not found in file" };
 
@@ -960,6 +986,7 @@ function multiEdit(input: Record<string, unknown>): ToolResult {
   if (!existsSync(path)) return { success: false, output: `File not found: ${path}` };
   if (!Array.isArray(edits) || edits.length === 0) return { success: false, output: "edits array is required and must not be empty" };
 
+  backupFile(path); // Save backup before modification
   let content = readFileSync(path, "utf-8");
   const diffParts: string[] = [];
   const CTX = 2;
@@ -1067,14 +1094,27 @@ function searchContent(input: Record<string, unknown>): ToolResult {
 }
 
 async function runCommand(input: Record<string, unknown>): Promise<ToolResult> {
-  const command = input.command as string;
+  let command = input.command as string;
   const cwd = input.working_directory ? resolvePath(input.working_directory as string) : undefined;
   const timeout = Math.min((input.timeout as number) || 30000, 300000);
   const background = input.run_in_background as boolean;
+  const disableSandbox = input.dangerouslyDisableSandbox as boolean;
+  const description = input.description as string | undefined;
+
+  debugLog("tools", `run_command: ${description || command.slice(0, 80)}`, { cwd, timeout, background, sandbox: !disableSandbox });
 
   const dangerous = ["rm -rf /", "rm -rf ~", "mkfs", "dd if=", "> /dev/sd"];
   if (dangerous.some((d) => command.includes(d))) {
     return { success: false, output: "Command blocked for safety" };
+  }
+
+  // Apply sandbox wrapping (macOS only, unless explicitly disabled)
+  let sandboxProfilePath: string | null = null;
+  if (!disableSandbox && !background) {
+    const effectiveCwd = cwd || process.cwd();
+    const sandboxResult = sandboxCommand(command, effectiveCwd);
+    command = sandboxResult.wrapped;
+    sandboxProfilePath = sandboxResult.profilePath;
   }
 
   // Background mode — spawn detached, validate, return with status
@@ -1126,6 +1166,7 @@ async function runCommand(input: Record<string, unknown>): Promise<ToolResult> {
 
     child.on("exit", (code) => {
       clearTimeout(timer);
+      cleanupSandbox(sandboxProfilePath);
       const output = stdout.join("") + (stderr.length > 0 ? "\n" + stderr.join("") : "");
       if (killed) {
         resolve({ success: false, output: `Command timed out after ${timeout}ms.\n${output}`.slice(0, 5000) });
@@ -1138,6 +1179,7 @@ async function runCommand(input: Record<string, unknown>): Promise<ToolResult> {
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      cleanupSandbox(sandboxProfilePath);
       resolve({ success: false, output: `Spawn error: ${err.message}` });
     });
   });
@@ -2004,6 +2046,78 @@ async function lspTool(input: Record<string, unknown>): Promise<ToolResult> {
 }
 
 // ============================================================================
+// SKILL TOOL — invoke named skills
+// ============================================================================
+
+function skillTool(input: Record<string, unknown>): ToolResult {
+  const skillName = input.skill as string;
+  if (!skillName) return { success: false, output: "skill name is required" };
+
+  const args = ((input.args as string) || "").split(/\s+/).filter(Boolean);
+
+  // Resolution order:
+  // 1. .whale/commands/{skill}.md (project-local)
+  // 2. ~/.swagmanager/commands/{skill}.md (user global)
+  // 3. Built-in skills bundled with package
+
+  const localPath = join(process.cwd(), ".whale", "commands", `${skillName}.md`);
+  const globalPath = join(homedir(), ".swagmanager", "commands", `${skillName}.md`);
+  // Built-in skills: check both dist/ and src/ locations
+  const thisFileDir = dirname(new URL(import.meta.url).pathname);
+  const builtinPaths = [
+    join(thisFileDir, "builtin-skills", `${skillName}.md`),           // dist/cli/services/builtin-skills/
+    join(thisFileDir, "..", "..", "..", "src", "cli", "services", "builtin-skills", `${skillName}.md`), // src/ from dist/
+  ];
+
+  let template: string | null = null;
+  let source = "";
+
+  // Check local → global → builtin (multiple paths)
+  const candidates: Array<[string, string]> = [
+    [localPath, "local"],
+    [globalPath, "global"],
+    ...builtinPaths.map(p => [p, "builtin"] as [string, string]),
+  ];
+  for (const [path, src] of candidates) {
+    if (existsSync(path)) {
+      try {
+        let content = readFileSync(path, "utf-8");
+        // Strip frontmatter
+        if (content.startsWith("---")) {
+          const endIdx = content.indexOf("---", 3);
+          if (endIdx !== -1) {
+            content = content.slice(endIdx + 3).trim();
+          }
+        }
+        template = content;
+        source = src;
+        break;
+      } catch { /* skip */ }
+    }
+  }
+
+  if (!template) {
+    return {
+      success: false,
+      output: `Skill not found: ${skillName}. Available locations:\n  .whale/commands/${skillName}.md\n  ~/.swagmanager/commands/${skillName}.md\n\nBuilt-in skills: commit, review, review-pr`,
+    };
+  }
+
+  // Expand arguments ($1, $2, $ARGS)
+  let expanded = template;
+  for (let i = 0; i < args.length; i++) {
+    expanded = expanded.replace(new RegExp(`\\$${i + 1}`, "g"), args[i]);
+  }
+  expanded = expanded.replace(/\$ARGS/g, args.join(" "));
+  expanded = expanded.replace(/\$\d+/g, ""); // Clean up unused
+
+  return {
+    success: true,
+    output: `[Skill: ${skillName} (${source})]\n\n${expanded.trim()}`,
+  };
+}
+
+// ============================================================================
 // TASK TOOL — subagent execution
 // ============================================================================
 
@@ -2027,9 +2141,21 @@ async function taskTool(input: Record<string, unknown>): Promise<ToolResult> {
   const runInBackground = input.run_in_background as boolean | undefined;
   const maxTurns = input.max_turns as number | undefined;
   const agentName = input.name as string | undefined;
+  const teamName = input.team_name as string | undefined;
+  const mode = input.mode as string | undefined;
 
   if (!prompt) return { success: false, output: "prompt is required" };
   if (!subagent_type) return { success: false, output: "subagent_type is required" };
+
+  // Apply permission mode for subagent if specified
+  if (mode) {
+    const agentLoop = await getAgentLoop();
+    const parentMode = agentLoop.getPermissionMode();
+    agentLoop.setPermissionMode(mode as "default" | "plan" | "yolo");
+    // Note: mode resets are handled by subagent isolation
+  }
+
+  debugLog("tools", `task: ${agentName || subagent_type}`, { model, maxTurns, teamName, mode });
 
   try {
     // Background mode: start agent, return output file path immediately

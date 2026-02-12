@@ -6,6 +6,8 @@
  */
 
 import { EventEmitter } from "events";
+import { readFileSync, existsSync } from "fs";
+import { resolve } from "path";
 
 // ============================================================================
 // TYPES
@@ -129,14 +131,30 @@ export function exitPlanMode(): { success: boolean; message: string } {
     };
   }
 
-  const planFile = planModeState.planFile;
+  const planFile = planModeState.planFile || ".whale/plan.md";
   planModeState = { active: false };
 
   interactiveEvents.emit("planModeExited", { planFile });
 
+  // Read the plan file to display its content
+  const fullPath = resolve(process.cwd(), planFile);
+  let planContent = "";
+  if (existsSync(fullPath)) {
+    try {
+      planContent = readFileSync(fullPath, "utf-8").trim();
+    } catch { /* ignore read errors */ }
+  }
+
+  if (planContent) {
+    return {
+      success: true,
+      message: planContent,
+    };
+  }
+
   return {
     success: true,
-    message: `Exited plan mode. Plan saved to ${planFile}. Ready for implementation.`,
+    message: `Plan mode complete. Plan saved to ${planFile}.`,
   };
 }
 

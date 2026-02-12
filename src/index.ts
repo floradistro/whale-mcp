@@ -2,12 +2,14 @@
 /**
  * SwagManager MCP Server
  *
- * Standalone MCP server for managing inventory, orders, analytics,
- * customers, products, and more from any MCP client (Claude Code,
- * Claude Desktop, Cursor, etc.)
+ * Thin proxy that connects any MCP client (Claude Code, Cursor, etc.)
+ * to the SwagManager platform.
  *
- * Connects to your Supabase backend. Tools are loaded dynamically
- * from the ai_tool_registry table.
+ * - Tool DEFINITIONS loaded from ai_tool_registry (database-driven)
+ * - Tool EXECUTION proxied to the agent-chat edge function (server-driven)
+ *
+ * When tools change on the server, this MCP server automatically picks
+ * them up — no code changes, no rebuild, no redeploy.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -17,7 +19,6 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient } from "@supabase/supabase-js";
-import { executeTool, getImplementedTools } from "./tools/executor.js";
 import { startUpdateLoop } from "./updater.js";
 
 // ============================================================================
@@ -41,11 +42,14 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// Edge function URL for tool execution
+const EDGE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/agent-chat`;
+
 // Session ID for tracing — links all tool calls in one conversation
 const SESSION_ID = crypto.randomUUID();
 
 // ============================================================================
-// TOOL DEFINITIONS
+// TOOL DEFINITIONS (loaded from database)
 // ============================================================================
 
 interface ToolDefinition {
@@ -71,7 +75,8 @@ async function loadToolDefinitions(force = false): Promise<ToolDefinition[]> {
     const { data, error } = await supabase
       .from("ai_tool_registry")
       .select("name, description, definition")
-      .eq("is_active", true);
+      .eq("is_active", true)
+      .neq("tool_mode", "code");
 
     if (error) {
       console.error("[MCP] Failed to load tools from registry:", error.message);
@@ -93,15 +98,55 @@ async function loadToolDefinitions(force = false): Promise<ToolDefinition[]> {
 }
 
 // ============================================================================
+// TOOL EXECUTION (proxied to edge function)
+// ============================================================================
+
+interface ToolResult {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+}
+
+async function executeToolRemote(
+  toolName: string,
+  args: Record<string, unknown>,
+  storeId?: string
+): Promise<ToolResult> {
+  try {
+    const response = await fetch(EDGE_FUNCTION_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({
+        mode: "tool",
+        tool_name: toolName,
+        args,
+        store_id: storeId,
+      }),
+    });
+
+    const result = await response.json() as ToolResult;
+    return result;
+  } catch (err: any) {
+    return {
+      success: false,
+      error: `Edge function call failed: ${err.message}`,
+    };
+  }
+}
+
+// ============================================================================
 // MCP SERVER
 // ============================================================================
 
 const server = new Server(
-  { name: "swagmanager", version: "1.0.0" },
+  { name: "swagmanager", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
-// List available tools
+// List available tools — from database
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools = await loadToolDefinitions();
   console.error(`[MCP] Returning ${tools.length} tools`);
@@ -115,30 +160,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Execute a tool
+// Execute a tool — proxied to edge function
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolName = request.params.name;
   const toolArgs = (request.params.arguments || {}) as Record<string, any>;
 
-  console.error(`[MCP] Executing: ${toolName}`);
+  console.error(`[MCP] Executing: ${toolName} → edge function`);
 
-  // Validate tool is implemented
-  const implementedTools = getImplementedTools();
-  if (!implementedTools.includes(toolName)) {
-    return {
-      content: [{
-        type: "text" as const,
-        text: JSON.stringify({ error: `Tool "${toolName}" not implemented` }),
-      }],
-      isError: true,
-    };
-  }
-
-  // Execute with telemetry context
-  const result = await executeTool(supabase, toolName, toolArgs, STORE_ID || undefined, {
-    source: "mcp",
-    requestId: SESSION_ID
-  });
+  const result = await executeToolRemote(toolName, toolArgs, STORE_ID || undefined);
 
   if (result.success) {
     return {
@@ -165,14 +194,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================================
 
 async function main() {
-  console.error("[MCP] SwagManager MCP Server v1.0.0");
+  console.error("[MCP] SwagManager MCP Server v2.0.0 (proxy mode)");
   console.error(`[MCP] Supabase: ${SUPABASE_URL}`);
+  console.error(`[MCP] Edge function: ${EDGE_FUNCTION_URL}`);
   console.error(`[MCP] Store: ${STORE_ID || "(default)"}`);
   console.error(`[MCP] Session: ${SESSION_ID}`);
 
-  // Pre-load tools
+  // Pre-load tools from database
   const tools = await loadToolDefinitions(true);
-  console.error(`[MCP] Loaded ${tools.length} tools`);
+  console.error(`[MCP] Loaded ${tools.length} tools from registry`);
 
   // Start OTA update checker (non-blocking, runs in background)
   startUpdateLoop(true);

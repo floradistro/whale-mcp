@@ -80,12 +80,7 @@ export async function loadToolRegistry(
   cachedTools = data as ToolRegistryEntry[];
   cacheTimestamp = Date.now();
 
-  // Import dynamically to avoid circular dependency
-  const { getImplementedTools } = await import("../tools/executor.js");
-  const implementedTools = getImplementedTools();
-  const implementedCount = cachedTools.filter(t => implementedTools.includes(t.name)).length;
-
-  console.log(`[ToolRegistry] Loaded ${cachedTools.length} tools from registry (${implementedCount} implemented locally)`);
+  console.log(`[ToolRegistry] Loaded ${cachedTools.length} tools from registry (all executed server-side)`);
   return cachedTools;
 }
 

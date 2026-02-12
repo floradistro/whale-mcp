@@ -904,7 +904,7 @@ export function ChatApp() {
             <Text>
               <Text color="#0A84FF">  </Text>
               <Text color="#0A84FF"><Spinner type="dots" /></Text>
-              <Text dimColor>  {thinkingVerbRef.current}</Text>
+              <Text color="#86868B">  {thinkingVerbRef.current}</Text>
             </Text>
           )}
 

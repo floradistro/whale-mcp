@@ -43,7 +43,7 @@ export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps)
       <Text>
         <Text color="#30D158">●</Text>
         <Text color="#E5E5EA" bold> Team: {team.name}</Text>
-        <Text dimColor> · {team.tasksCompleted}/{team.tasksTotal} tasks</Text>
+        <Text color="#6E6E73"> · {team.tasksCompleted}/{team.tasksTotal} tasks</Text>
       </Text>
 
       {teammates.map(([id, mate], i) => {
@@ -56,7 +56,7 @@ export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps)
 
         return (
           <Text key={id}>
-            <Text dimColor>{branch}</Text>
+            <Text color="#6E6E73">{branch}</Text>
             {isWorking ? (
               <Text color="#0A84FF"><Spinner type="dots" /></Text>
             ) : isDone ? (
@@ -64,9 +64,9 @@ export const TeamPanel = React.memo(function TeamPanel({ team }: TeamPanelProps)
             ) : (
               <Text color="#FF453A">✕</Text>
             )}
-            <Text color={color} dimColor={!color}> {mate.name || mate.status}</Text>
+            <Text color={color || "#86868B"}> {mate.name || mate.status}</Text>
             {mate.name && mate.status !== mate.name && mate.status !== "done" && mate.status !== "failed" ? (
-              <Text dimColor> — {mate.status}</Text>
+              <Text color="#6E6E73"> — {mate.status}</Text>
             ) : null}
           </Text>
         );

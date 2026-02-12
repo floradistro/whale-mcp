@@ -212,7 +212,7 @@ const fmtCustomers: Fmt = (data, input) => {
     const name = [data.first_name, data.last_name].filter(Boolean).join(" ");
     return card("Customer Created", [
       ["Name", name || "—"],
-      ["Email", data.email || "—"],
+      ["Email", email(data.email)],
       ["ID", `\`${data.id}\``],
     ]);
   }
@@ -830,17 +830,68 @@ const fmtInventoryAudit: Fmt = (data, input) => {
   return null;
 };
 
+// ── STORE INFO ──
+
+const fmtStoreInfo: Fmt = (data) => {
+  if (!data) return "**Store Info** — not found";
+
+  const fields: [string, string][] = [];
+  if (data.store_tagline) fields.push(["", `"${data.store_tagline}"`]);
+  if (data.logo_url) fields.push(["Logo", data.logo_url]);
+  if (data.banner_url) fields.push(["Banner", data.banner_url]);
+
+  if (data.brand_colors && typeof data.brand_colors === "object") {
+    const colors = Object.entries(data.brand_colors)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    if (colors) fields.push(["Colors", colors]);
+  }
+
+  if (data.email) fields.push(["Email", `\`${data.email}\``]);
+  if (data.phone) fields.push(["Phone", data.phone]);
+  const location = [data.city, data.state].filter(Boolean).join(", ");
+  if (location) fields.push(["Location", location]);
+  if (data.ecommerce_url) fields.push(["Website", data.ecommerce_url]);
+
+  if (data.social_links && typeof data.social_links === "object") {
+    const links = Object.entries(data.social_links)
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    if (links) fields.push(["Social", links]);
+  }
+
+  if (data.store_description) fields.push(["About", data.store_description]);
+
+  return card(data.store_name || "Store", fields);
+};
+
 // ── EMAIL ──
+
+/** Wrap email in backticks to prevent GFM autolinking and render as inline code */
+function email(addr: string | undefined | null): string {
+  if (!addr) return "—";
+  return `\`${addr}\``;
+}
 
 const fmtEmail: Fmt = (data, input) => {
   const action = input.action as string;
 
   if (action === "send" || action === "send_template") {
-    return card("Email Sent", [
-      ["To", data.to || data.to_email || "—"],
-      ["Subject", data.subject || "—"],
-      ["Status", badge("success")],
-    ]);
+    // Pull fields from input args (always present) — edge function response rarely echoes them
+    const to = (input.to as string) || data?.to || data?.to_email;
+    const subject = (input.subject as string) || data?.subject;
+    const from = (input.from as string) || data?.from || data?.from_email;
+    const template = (input.template as string) || data?.template;
+
+    const lines = [`**Email Sent** ✉`, ""];
+    if (from)     lines.push(`**From**      ${email(from)}`);
+    if (to)       lines.push(`**To**        ${email(to)}`);
+    if (subject)  lines.push(`**Subject**   ${subject}`);
+    if (template) lines.push(`**Template**  \`${template}\``);
+    lines.push(`**Status**    ${badge("success")}`);
+    if (data?.id) lines.push(`**ID**        \`${data.id}\``);
+    return lines.join("\n");
   }
 
   if (action === "list") {
@@ -860,6 +911,18 @@ const fmtEmail: Fmt = (data, input) => {
         ])
       ),
     ].join("\n");
+  }
+
+  if (action === "get") {
+    if (!data) return null;
+    const lines = [`**Email** — ${badge(data.status)}`, ""];
+    if (data.from_email) lines.push(`**From**      ${email(data.from_email)}`);
+    if (data.to_email)   lines.push(`**To**        ${email(data.to_email)}`);
+    if (data.subject)    lines.push(`**Subject**   ${data.subject}`);
+    if (data.category)   lines.push(`**Category**  \`${data.category}\``);
+    if (data.created_at) lines.push(`**Sent**      ${time(data.created_at)}`);
+    if (data.id)         lines.push(`**ID**        \`${data.id}\``);
+    return lines.join("\n");
   }
 
   if (action === "inbox") {
@@ -883,6 +946,53 @@ const fmtEmail: Fmt = (data, input) => {
     ].join("\n");
   }
 
+  if (action === "inbox_get") {
+    const thread = data?.thread;
+    const messages = data?.messages || [];
+    if (!thread) return null;
+
+    const customerName = thread.customer
+      ? `${thread.customer.first_name || ""} ${thread.customer.last_name || ""}`.trim()
+      : null;
+
+    const lines = [
+      `**Thread** — ${thread.subject || "No subject"}  ${badge(thread.status)}`,
+      "",
+    ];
+    if (customerName)       lines.push(`**Customer**  ${customerName} ${email(thread.customer?.email)}`);
+    if (thread.priority)    lines.push(`**Priority**  ${thread.priority}`);
+    if (thread.ai_summary)  lines.push(`**Summary**   ${thread.ai_summary}`);
+    if (messages.length > 0) {
+      lines.push("");
+      lines.push(table(
+        ["Dir", "From", "Subject", "Date"],
+        messages.slice(0, 20).map((m: any) => [
+          m.direction === "inbound" ? "← In" : "→ Out",
+          m.from_name || m.from_email || "—",
+          (m.subject || "—").slice(0, 30),
+          time(m.created_at),
+        ])
+      ));
+    }
+    return lines.join("\n");
+  }
+
+  if (action === "inbox_reply") {
+    return [
+      `**Reply Sent** ✉  ${badge("success")}`,
+      "",
+      `Thread \`${(input.thread_id as string)?.slice(0, 8) || "?"}\``,
+    ].join("\n");
+  }
+
+  if (action === "inbox_update") {
+    const fields: string[] = [];
+    if (data?.status)   fields.push(`Status → ${badge(data.status)}`);
+    if (data?.priority) fields.push(`Priority → **${data.priority}**`);
+    if (data?.intent)   fields.push(`Intent → **${data.intent}**`);
+    return `**Thread Updated**  ${fields.join("  ·  ") || badge("success")}`;
+  }
+
   if (action === "inbox_stats") {
     if (!data || typeof data !== "object") return null;
     const entries: [string, string][] = [];
@@ -890,6 +1000,135 @@ const fmtEmail: Fmt = (data, input) => {
       entries.push([key.replace(/_/g, " "), String(value)]);
     }
     return card("Inbox Stats", entries);
+  }
+
+  if (action === "templates") {
+    const items = Array.isArray(data) ? data : [];
+    if (items.length === 0) return "**Email Templates** — none found";
+
+    return [
+      `**Email Templates** — ${items.length} found`,
+      "",
+      table(
+        ["Name", "Subject", "Status"],
+        items.slice(0, 15).map((t: any) => [
+          t.name || "—",
+          (t.subject || "—").slice(0, 35),
+          badge(t.is_active !== false ? "active" : "inactive"),
+        ])
+      ),
+    ].join("\n");
+  }
+
+  if (action === "create_template") {
+    return card("Template Created", [
+      ["Name", data.name || "—"],
+      ["Slug", data.slug ? `\`${data.slug}\`` : "—"],
+      ["Subject", data.subject || "—"],
+      ["Category", data.category || "—"],
+      ["Status", badge(data.is_active !== false ? "active" : "inactive")],
+      ["ID", `\`${data.id}\``],
+    ]);
+  }
+
+  if (action === "update_template") {
+    return `**Template Updated** — ${data.name || data.id} ${badge("success")}`;
+  }
+
+  if (action === "delete_template") {
+    return `**Template Deactivated** — ${data.name || data.slug || data.id} ${badge("inactive")}`;
+  }
+
+  if (action === "domains_list") {
+    const items = Array.isArray(data) ? data : [];
+    if (items.length === 0) return "**Email Domains** — none configured";
+
+    return [
+      `**Email Domains** — ${items.length} found`,
+      "",
+      table(
+        ["Domain", "Subdomain", "Status", "Sending", "Receiving", "Added"],
+        items.map((d: any) => [
+          d.domain || "—",
+          d.inbound_subdomain || "—",
+          badge(d.status),
+          badge(d.sending_verified ? "verified" : "pending"),
+          badge(d.receiving_enabled ? "enabled" : "disabled"),
+          date(d.created_at),
+        ])
+      ),
+    ].join("\n");
+  }
+
+  if (action === "domains_add") {
+    const dns = data?.dns_records || [];
+    const lines = [
+      `**Domain Added** — ${data.domain || "—"}  ${badge("pending")}`,
+      "",
+      data.message || "Add the following DNS records:",
+      "",
+    ];
+    if (dns.length > 0) {
+      lines.push(table(
+        ["Record", "Type", "Name", "Value", "Priority"],
+        dns.map((r: any) => [
+          r.record || "—",
+          r.type || "—",
+          r.name || "—",
+          (r.value || "—").slice(0, 50),
+          r.priority != null ? String(r.priority) : "—",
+        ])
+      ));
+    }
+    return lines.join("\n");
+  }
+
+  if (action === "domains_verify") {
+    const dns = data?.dns_records || [];
+    const allVerified = dns.length > 0 && dns.every((r: any) => r.status === "verified");
+    return [
+      `**Domain Verification** — ${data.domain || "—"}  ${badge(allVerified ? "verified" : "pending")}`,
+      "",
+      table(
+        ["Record", "Type", "Name", "Status"],
+        dns.map((r: any) => [
+          r.record || "—",
+          r.type || "—",
+          r.name || "—",
+          badge(r.status),
+        ])
+      ),
+    ].join("\n");
+  }
+
+  if (action === "addresses_list") {
+    const items = Array.isArray(data) ? data : [];
+    if (items.length === 0) return "**Email Addresses** — none configured";
+
+    return [
+      `**Email Addresses** — ${items.length} found`,
+      "",
+      table(
+        ["Address", "Display Name", "Mailbox", "AI", "Active"],
+        items.map((a: any) => [
+          a.full_email || a.address || "—",
+          a.display_name || "—",
+          a.mailbox_type || "—",
+          a.ai_enabled ? "✓" : "—",
+          badge(a.is_active !== false ? "active" : "inactive"),
+        ])
+      ),
+    ].join("\n");
+  }
+
+  if (action === "addresses_add") {
+    return card("Address Created", [
+      ["Address", data.full_email || data.address || "—"],
+      ["Display Name", data.display_name || "—"],
+      ["Mailbox", data.mailbox_type || "general"],
+      ["AI Enabled", data.ai_enabled ? "Yes" : "No"],
+      ["ID", `\`${data.id}\``],
+    ]);
   }
 
   return null;
@@ -955,19 +1194,79 @@ const fmtAuditTrail: Fmt = (data, input) => {
 // REGISTRY
 // ============================================================================
 
+// ── SUPPLY_CHAIN (consolidated: purchase_orders + transfers + suppliers) ──
+
+const fmtSupplyChain: Fmt = (data, input) => {
+  const action = input.action as string;
+
+  // Route PO actions to PO formatter
+  if (action?.startsWith("po_")) {
+    return fmtPurchaseOrders(data, { ...input, action: action.slice(3) });
+  }
+
+  // Route transfer actions to transfer formatter
+  if (action?.startsWith("transfer_")) {
+    return fmtTransfers(data, { ...input, action: action.slice(9) });
+  }
+
+  // Route supplier lookup
+  if (action === "find_suppliers") {
+    return fmtSuppliers(data, input);
+  }
+
+  return null;
+};
+
+// ── STORE (consolidated: store_info + locations + alerts) ──
+
+const fmtStore: Fmt = (data, input) => {
+  const action = input.action as string;
+
+  if (action === "info") return fmtStoreInfo(data, input);
+  if (action === "locations") return fmtLocations(data, input);
+  if (action === "alerts") return fmtAlerts(data, input);
+
+  return null;
+};
+
+// ── INVENTORY (consolidated: includes query + audit actions) ──
+
+const fmtInventoryConsolidated: Fmt = (data, input) => {
+  const action = input.action as string;
+
+  // Query actions (formerly inventory_query)
+  if (["summary", "velocity", "by_location", "in_stock"].includes(action)) {
+    return fmtInventoryQuery(data, input);
+  }
+
+  // Audit actions (formerly inventory_audit — strip "audit_" prefix for formatter)
+  if (action?.startsWith("audit_")) {
+    return fmtInventoryAudit(data, { ...input, action: action.slice(6) });
+  }
+
+  // Mutation actions (adjust, set, transfer, bulk_*)
+  return fmtInventory(data, input);
+};
+
 const FORMATTERS: Record<string, Fmt> = {
-  inventory: fmtInventory,
+  // Consolidated tools
+  inventory: fmtInventoryConsolidated,
+  supply_chain: fmtSupplyChain,
+  store: fmtStore,
+  // Legacy names still in handler map — keep formatters for backwards compat
   inventory_query: fmtInventoryQuery,
   inventory_audit: fmtInventoryAudit,
   transfers: fmtTransfers,
   purchase_orders: fmtPurchaseOrders,
-  orders: fmtOrders,
-  analytics: fmtAnalytics,
-  alerts: fmtAlerts,
-  products: fmtProducts,
-  customers: fmtCustomers,
   locations: fmtLocations,
   suppliers: fmtSuppliers,
+  store_info: fmtStoreInfo,
+  alerts: fmtAlerts,
+  // Unchanged tools
+  orders: fmtOrders,
+  analytics: fmtAnalytics,
+  products: fmtProducts,
+  customers: fmtCustomers,
   email: fmtEmail,
   audit_trail: fmtAuditTrail,
 };

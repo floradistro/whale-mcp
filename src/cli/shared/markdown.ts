@@ -11,10 +11,9 @@ import { markedTerminal } from "marked-terminal";
 import chalk from "chalk";
 import { createRequire } from "module";
 
-// Force true color — macOS Terminal supports 24-bit since Ventura but doesn't
-// set COLORTERM=truecolor, so chalk/supports-color falls back to 256-color
-// which maps our subtle hex backgrounds (#1a3a2a etc.) to gray.
-if (chalk.level < 3) chalk.level = 3;
+// Note: chalk.level is auto-detected by supports-color.
+// Apple_Terminal → level 2 (256-color), iTerm.app v3+ → level 3 (24-bit).
+// Do NOT force level 3 — Terminal.app can't render 24-bit codes (shows gray).
 
 const require = createRequire(import.meta.url);
 const { highlight } = require("cli-highlight") as typeof import("cli-highlight");
@@ -41,12 +40,41 @@ const lavender     = chalk.hex("#D4BBFF");
 const roseGold     = chalk.hex("#FFB5C2");
 
 // ============================================================================
-// OSC 8 hyperlinks — clickable in iTerm2, Warp, Kitty, WezTerm, etc.
+// OSC 8 hyperlinks — only in terminals that support them
 // ============================================================================
 
+/** Detect if terminal supports OSC 8 clickable hyperlinks */
+const supportsOsc8 = (() => {
+  const tp = process.env.TERM_PROGRAM || "";
+  if (/iterm|wezterm|kitty|hyper|warp|foot|alacritty/i.test(tp)) return true;
+  if (process.env.VTE_VERSION) return true;     // GNOME Terminal, Tilix
+  if (process.env.WT_SESSION) return true;       // Windows Terminal
+  if (process.env.KONSOLE_VERSION) return true;  // Konsole
+  // Apple Terminal.app does NOT support OSC 8
+  return false;
+})();
+
 function hyperlink(url: string, text?: string): string {
+  // mailto: → clean email address, no protocol prefix, no OSC 8
+  if (url.startsWith("mailto:")) {
+    const email = text || url.slice(7);
+    return systemCyan(email);
+  }
+
+  // tel: → clean phone number
+  if (url.startsWith("tel:")) {
+    return systemCyan(text || url.slice(4));
+  }
+
   const display = text || url;
-  return `\x1B]8;;${url}\x07${systemCyan.underline(display)}\x1B]8;;\x07`;
+
+  // OSC 8 clickable links — only where terminal supports them
+  if (supportsOsc8) {
+    return `\x1B]8;;${url}\x07${systemCyan.underline(display)}\x1B]8;;\x07`;
+  }
+
+  // Fallback: colored underlined text (no escape sequences)
+  return systemCyan.underline(display);
 }
 
 // ============================================================================
@@ -202,11 +230,12 @@ marked.use(
 // Diff renderer — background colors + word-level diff (Claude Code parity)
 // ============================================================================
 
-// Background colors for diff lines (true color required — forced above)
-const diffAddedBg    = chalk.bgHex("#1E3D28").hex("#69DB7C");  // dark green bg, bright green text
-const diffRemovedBg  = chalk.bgHex("#402428").hex("#FFA8B4");  // dark red bg, pink text
-const diffWordAdded  = chalk.bgHex("#2F7840").hex("#D0FFD8");  // brighter green bg, light green text
-const diffWordRemoved = chalk.bgHex("#803040").hex("#FFD0D8"); // brighter red bg, light pink text
+// Background colors for diff lines — 256-color safe (exact cube values)
+// At level 2: #005f00 → index 22, #5f0000 → index 52, etc.
+const diffAddedBg     = chalk.bgHex("#005f00").white;           // dark green bg, white text
+const diffRemovedBg   = chalk.bgHex("#5f0000").white;           // dark red bg, white text
+const diffWordAdded   = chalk.bgHex("#008700").whiteBright.bold; // brighter green bg, bold white
+const diffWordRemoved = chalk.bgHex("#870000").whiteBright.bold; // brighter red bg, bold white
 
 /** Compute word-level diff between two lines. Returns arrays of {text, changed} segments. */
 function wordDiff(oldLine: string, newLine: string): { old: {text: string; changed: boolean}[]; new: {text: string; changed: boolean}[] } {
@@ -254,7 +283,7 @@ function renderSegments(segs: {text: string; changed: boolean}[], wordStyle: (s:
 
 function renderDiff(code: string): string {
   const lines = code.split("\n");
-  const termWidth = (process.stdout.columns || 80) - 2; // -2 for Box marginLeft
+  const termWidth = (process.stdout.columns || 80) - 6; // -6 for nested margins (MessageList=2 + ToolIndicator=2 + safety=2)
 
   // Parse into segments from unified diff format
   type Seg = { type: "remove" | "add" | "context"; content: string; lineNo: number };

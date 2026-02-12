@@ -1,6 +1,6 @@
 {
   "name": "swagmanager-mcp",
-  "version": "4.6.0",
+  "version": "4.7.0",
   "description": "whale code — local-first AI agent CLI for inventory, orders, and analytics powered by MCP",
   "type": "module",
   "main": "dist/index.js",
@@ -42,6 +42,7 @@
   "files": [
     "dist",
     "bin",
+    "src/cli/services/builtin-skills",
     "README.md"
   ],
   "publishConfig": {

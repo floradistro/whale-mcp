@@ -183,7 +183,7 @@ async function _logSpan(opts: SpanOptions): Promise<void> {
   const { error } = await client.from("audit_logs").insert({
     action: opts.action,
     severity: opts.severity || (opts.error ? "error" : "info"),
-    store_id: opts.storeId || null,
+    store_id: opts.storeId || resolveConfig().storeId || null,
     user_id: ctx.userId || null,
     user_email: ctx.userEmail || null,
     resource_type: "cli_span",
@@ -214,7 +214,7 @@ async function _logSpan(opts: SpanOptions): Promise<void> {
     conversation_id: ctx.conversationId || null,
 
     details: {
-      source: "whale_mcp",
+      source: ctx.source || "whale_cli",
       conversation_id: ctx.conversationId || conversationId,
       turn_number: ctx.turnNumber ?? turnNumber,
       parent_span_id: ctx.parentSpanId || null,

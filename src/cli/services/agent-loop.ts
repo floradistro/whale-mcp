@@ -9,7 +9,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, appendFileSync } from "fs";
 import { execSync } from "child_process";
 import { join, resolve, dirname } from "path";
 import { homedir } from "os";
@@ -18,6 +18,10 @@ import {
   executeLocalTool,
   isLocalTool,
 } from "./local-tools.js";
+import {
+  INTERACTIVE_TOOL_DEFINITIONS,
+  executeInteractiveTool,
+} from "./interactive-tools.js";
 import { LoopDetector } from "./loop-detector.js";
 import { loadConfig, resolveConfig } from "./config-store.js";
 import { getValidToken, SUPABASE_URL } from "./auth-service.js";
@@ -71,6 +75,13 @@ export interface AgentLoopOptions {
   abortSignal?: AbortSignal;
   model?: string;
   emitter?: AgentEventEmitter; // Event emitter for decoupled UI
+  // v4.7.0 extensions
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+  effort?: "low" | "medium" | "high";
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  fallbackModel?: string;
 }
 
 // ============================================================================
@@ -100,6 +111,22 @@ export function getModelShortName(): string {
   if (activeModel.includes("opus")) return "opus";
   if (activeModel.includes("haiku")) return "haiku";
   return "sonnet";
+}
+
+// ============================================================================
+// COST TRACKING — per-model pricing for budget enforcement
+// ============================================================================
+
+const MODEL_PRICING: Record<string, { inputPer1M: number; outputPer1M: number }> = {
+  "claude-sonnet-4-20250514":  { inputPer1M: 3.0,  outputPer1M: 15.0 },
+  "claude-opus-4-6":           { inputPer1M: 15.0, outputPer1M: 75.0 },
+  "claude-haiku-4-5-20251001": { inputPer1M: 1.0,  outputPer1M: 5.0  },
+};
+
+export function estimateCostUsd(inputTokens: number, outputTokens: number, model?: string): number {
+  const pricing = MODEL_PRICING[model || activeModel] || MODEL_PRICING["claude-sonnet-4-20250514"];
+  return (inputTokens / 1_000_000) * pricing.inputPer1M +
+         (outputTokens / 1_000_000) * pricing.outputPer1M;
 }
 
 // ============================================================================
@@ -167,6 +194,7 @@ export interface SessionMeta {
   messageCount: number;
   createdAt: string;
   updatedAt: string;
+  cwd?: string;
 }
 
 export function saveSession(
@@ -182,9 +210,11 @@ export function saveSession(
     messageCount: messages.length,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    cwd: process.cwd(),
   };
   const data = JSON.stringify({ meta, messages }, null, 2);
   writeFileSync(join(SESSIONS_DIR, `${id}.json`), data, "utf-8");
+  logSessionHistory(meta);
   return id;
 }
 
@@ -211,6 +241,29 @@ export function listSessions(limit = 20): SessionMeta[] {
     } catch { /* skip corrupted */ }
   }
   return sessions;
+}
+
+const HISTORY_FILE = join(homedir(), ".swagmanager", "history.jsonl");
+
+function logSessionHistory(meta: SessionMeta): void {
+  try {
+    const dir = join(homedir(), ".swagmanager");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const entry = {
+      display: meta.title,
+      project: meta.cwd || process.cwd(),
+      timestamp: meta.updatedAt,
+      sessionId: meta.id,
+      model: meta.model,
+    };
+    appendFileSync(HISTORY_FILE, JSON.stringify(entry) + "\n");
+  } catch { /* best effort */ }
+}
+
+export function findLatestSessionForCwd(): SessionMeta | null {
+  const cwd = process.cwd();
+  const sessions = listSessions(100);
+  return sessions.find(s => s.cwd === cwd) || null;
 }
 
 function extractSessionTitle(messages: Anthropic.MessageParam[]): string {
@@ -470,6 +523,8 @@ const PLAN_MODE_TOOLS = new Set([
   "read_file", "list_directory", "search_files", "search_content",
   "glob", "grep", "web_fetch", "web_search", "task", "task_output",
   "bash_output", "list_shells", "tasks", "config", "ask_user",
+  // Interactive tools (read-only by nature)
+  "ask_user_question", "enter_plan_mode", "exit_plan_mode",
 ]);
 
 export function setPermissionMode(mode: PermissionMode): { success: boolean; message: string } {
@@ -493,7 +548,7 @@ export function isToolAllowedByPermission(toolName: string): boolean {
 // SYSTEM PROMPT
 // ============================================================================
 
-function buildSystemPrompt(hasServerTools: boolean): string {
+function buildSystemPrompt(hasServerTools: boolean, effort?: "low" | "medium" | "high"): string {
   let prompt = `You are whale code, a CLI AI assistant.
 
 ## Working Directory
@@ -520,6 +575,13 @@ ${process.cwd()}`;
     prompt += `\n\n## Mode: Plan (read-only)\nYou are in plan mode. Only read/search tools are available. No file writes or commands.`;
   } else if (activePermissionMode === "yolo") {
     prompt += `\n\n## Mode: Yolo (full access)\nAll tools available without confirmation.`;
+  }
+
+  // Effort level
+  if (effort === "low") {
+    prompt += `\n\n## Effort: Low\nBe concise and direct. Minimize exploration. Give brief answers.`;
+  } else if (effort === "high") {
+    prompt += `\n\n## Effort: High\nBe thorough and exhaustive. Explore deeply. Verify your work.`;
   }
 
   // Persistent memory
@@ -559,12 +621,20 @@ Be concise. Use tools to do work — don't just explain.`;
 // TOOL DEFINITIONS
 // ============================================================================
 
-async function getTools(): Promise<{ tools: Anthropic.Tool[]; serverToolCount: number }> {
+async function getTools(allowedTools?: string[], disallowedTools?: string[]): Promise<{ tools: Anthropic.Tool[]; serverToolCount: number }> {
   const localTools: Anthropic.Tool[] = LOCAL_TOOL_DEFINITIONS.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.input_schema as Anthropic.Tool["input_schema"],
   }));
+
+  // Add interactive tools (ask_user_question, enter_plan_mode, exit_plan_mode)
+  const interactiveTools: Anthropic.Tool[] = INTERACTIVE_TOOL_DEFINITIONS.map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.input_schema as Anthropic.Tool["input_schema"],
+  }));
+  localTools.push(...interactiveTools);
 
   let serverTools: Anthropic.Tool[] = [];
   try {
@@ -577,8 +647,20 @@ async function getTools(): Promise<{ tools: Anthropic.Tool[]; serverToolCount: n
   const localNames = new Set(localTools.map(t => t.name));
   const uniqueServerTools = serverTools.filter(t => !localNames.has(t.name));
 
+  let allTools = [...localTools, ...uniqueServerTools];
+
+  // Apply tool filtering
+  if (allowedTools && allowedTools.length > 0) {
+    const allowed = new Set(allowedTools);
+    allTools = allTools.filter(t => allowed.has(t.name));
+  }
+  if (disallowedTools && disallowedTools.length > 0) {
+    const disallowed = new Set(disallowedTools);
+    allTools = allTools.filter(t => !disallowed.has(t.name));
+  }
+
   return {
-    tools: [...localTools, ...uniqueServerTools],
+    tools: allTools,
     serverToolCount: uniqueServerTools.length,
   };
 }
@@ -883,8 +965,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
     setGlobalEmitter(emitter);
   }
 
-  const { tools, serverToolCount } = await getTools();
-  const systemPrompt = buildSystemPrompt(serverToolCount > 0);
+  const effectiveMaxTurns = opts.maxTurns || MAX_TURNS;
+
+  const { tools, serverToolCount } = await getTools(opts.allowedTools, opts.disallowedTools);
+  const systemPrompt = buildSystemPrompt(serverToolCount > 0, opts.effort);
 
   // Apply context compression before starting — notify user if it fires
   const compressedHistory = compressContext(conversationHistory, (before, after, saved) => {
@@ -921,9 +1005,17 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
     },
   });
 
+  let sessionCostUsd = 0;
+
   try {
-    for (let iteration = 0; iteration < MAX_TURNS; iteration++) {
+    for (let iteration = 0; iteration < effectiveMaxTurns; iteration++) {
       if (abortSignal?.aborted) { callbacks.onError("Cancelled", messages); return; }
+
+      // Budget enforcement
+      if (opts.maxBudgetUsd && sessionCostUsd >= opts.maxBudgetUsd) {
+        callbacks.onError(`Budget exceeded: $${sessionCostUsd.toFixed(4)} >= $${opts.maxBudgetUsd}`, messages);
+        return;
+      }
 
       // Mid-loop auto-compact: if context grew large during tool use, compress before next API call
       if (iteration > 0 && needsCompaction(messages)) {
@@ -981,6 +1073,23 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             });
 
             await sleep(delay);
+
+            // Fallback model on last retry
+            if (attempt === MAX_RETRIES - 1 && opts.fallbackModel) {
+              const savedModel = activeModel;
+              setModel(opts.fallbackModel);
+              logSpan({
+                action: "claude_api_fallback",
+                durationMs: 0,
+                context: { ...turnCtx, spanId: apiSpanId },
+                storeId: storeId || undefined,
+                details: {
+                  from_model: savedModel,
+                  to_model: activeModel,
+                  reason: String(err?.message || err),
+                },
+              });
+            }
             continue;
           }
           throw err; // Non-retryable or exhausted retries
@@ -993,6 +1102,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       totalOut += result.totalOut;
       totalCacheCreation += result.cacheCreationTokens;
       totalCacheRead += result.cacheReadTokens;
+
+      // Track cost
+      sessionCostUsd += estimateCostUsd(result.totalIn, result.totalOut);
 
       // Collect assistant text for telemetry
       if (result.text) {
@@ -1081,7 +1193,26 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
           return;
         }
 
-        if (isLocalTool(tu.name)) {
+        // Interactive tools (ask_user_question, enter_plan_mode, exit_plan_mode)
+        const INTERACTIVE_TOOL_NAMES = new Set(INTERACTIVE_TOOL_DEFINITIONS.map(t => t.name));
+        if (INTERACTIVE_TOOL_NAMES.has(tu.name)) {
+          const interactiveResult = await executeInteractiveTool(tu.name, tu.input);
+          toolResult = { success: interactiveResult.success, output: interactiveResult.output };
+
+          logSpan({
+            action: `tool.${tu.name}`,
+            durationMs: Date.now() - toolStart,
+            context: { ...turnCtx, parentSpanId: apiSpanId },
+            storeId: storeId || undefined,
+            error: toolResult.success ? undefined : String(toolResult.output),
+            details: {
+              tool_type: "interactive",
+              tool_input: tu.input,
+              tool_result: truncateResult(toolResult.output, 2000),
+              iteration,
+            },
+          });
+        } else if (isLocalTool(tu.name)) {
           toolResult = await executeLocalTool(tu.name, tu.input);
 
           logSpan({
@@ -1100,24 +1231,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             },
           });
         } else if (isServerTool(tu.name)) {
+          // Server tools log via executor.ts (sanitized args, retryable, sub-actions, bytes).
+          // Pass agent-loop context so executor captures iteration + parentSpanId + toolType.
           toolResult = await executeServerTool(tu.name, tu.input, {
             ...turnCtx,
-            spanId: undefined,
-          });
-
-          logSpan({
-            action: `tool.${tu.name}`,
-            durationMs: Date.now() - toolStart,
-            context: { ...turnCtx, parentSpanId: apiSpanId },
-            storeId: storeId || undefined,
-            error: toolResult.success ? undefined : String(toolResult.output),
-            details: {
-              tool_type: "server",
-              tool_input: tu.input,
-              tool_result: truncateResult(toolResult.output, 2000),
-              error_type: toolResult.success ? undefined : classifyToolError(toolResult.output),
-              iteration,
-            },
+            parentSpanId: apiSpanId,
+            iteration,
+            toolType: "server",
           });
         } else {
           toolResult = { success: false, output: `Unknown tool: ${tu.name}` };

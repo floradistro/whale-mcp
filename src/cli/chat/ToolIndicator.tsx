@@ -137,7 +137,7 @@ const LANG_MAP: Record<string, string> = {
 // TOOL CATEGORIES — unique icon + color per tool type
 // ============================================================================
 
-type ToolCategory = "read" | "write" | "edit" | "search" | "command" | "directory" | "web" | "agent" | "todo" | "notebook" | "server" | "lsp";
+type ToolCategory = "read" | "write" | "edit" | "search" | "command" | "directory" | "web" | "agent" | "todo" | "notebook" | "server" | "lsp" | "interactive";
 
 interface CategoryStyle {
   icon: string;
@@ -156,7 +156,8 @@ const CATEGORY_STYLES: Record<ToolCategory, CategoryStyle> = {
   todo:      { icon: "☐", color: "#30D158" },   // green
   notebook:  { icon: "◫", color: "#FF9F0A" },   // orange
   server:    { icon: "▹", color: "#FF375F" },   // pink
-  lsp:       { icon: "⊞", color: "#64D2FF" },   // cyan
+  lsp:         { icon: "⊞", color: "#64D2FF" },   // cyan
+  interactive: { icon: "▹", color: "#5E5CE6" },   // indigo
 };
 
 const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
@@ -184,6 +185,10 @@ const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
   task_output: "agent",
   task_stop: "agent",
   lsp: "lsp",
+  enter_plan_mode: "interactive",
+  exit_plan_mode: "interactive",
+  ask_user_question: "interactive",
+  skill: "command",
 };
 
 function getToolCategory(name: string): ToolCategory {
@@ -216,6 +221,10 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   task_output: "TaskOutput",
   task_stop: "TaskStop",
   lsp: "LSP",
+  enter_plan_mode: "PlanMode",
+  exit_plan_mode: "PlanMode",
+  ask_user_question: "AskUser",
+  skill: "Skill",
 };
 
 export function getDisplayName(name: string): string {
@@ -239,6 +248,8 @@ function formatSearchResult(result: string): string {
   }).join("\n");
 }
 
+const PLAIN_TEXT_TOOLS = new Set(["enter_plan_mode", "exit_plan_mode", "ask_user_question", "skill"]);
+
 function detectLang(toolName: string, input?: Record<string, unknown>): string {
   if (toolName === "edit_file" || toolName === "multi_edit") return "diff";
   if (toolName === "read_file" && input?.path) {
@@ -250,6 +261,8 @@ function detectLang(toolName: string, input?: Record<string, unknown>): string {
     return LANG_MAP[ext] || "";
   }
   if (toolName === "run_command" || toolName === "list_directory") return "bash";
+  // Interactive/plain tools — render as plain text or markdown (not JSON fences)
+  if (PLAIN_TEXT_TOOLS.has(toolName)) return "";
   if (!isLocalTool(toolName)) return "json";
   return "";
 }
@@ -383,13 +396,13 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           <Text color={catStyle.color}><Spinner type="dots" /></Text>
           <Text color={catStyle.color}> {catStyle.icon}</Text>
           <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-          {context ? <Text dimColor>  {context}</Text> : null}
+          {context ? <Text color="#86868B">  {context}</Text> : null}
         </Box>
         {/* Live streaming output for running commands */}
         {liveLines.length > 0 && (
           <Box flexDirection="column" marginLeft={4}>
             {liveLines.map((line, i) => (
-              <Text key={i} dimColor wrap="truncate">{line}</Text>
+              <Text key={i} color="#6E6E73" wrap="truncate">{line}</Text>
             ))}
           </Box>
         )}
@@ -405,8 +418,8 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           <Text color="#FF453A" bold>✕</Text>
           <Text color={catStyle.color}> {catStyle.icon}</Text>
           <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-          {context ? <Text dimColor>  {context}</Text> : null}
-          {durationMs !== undefined && <Text dimColor>  {formatDuration(durationMs)}</Text>}
+          {context ? <Text color="#86868B">  {context}</Text> : null}
+          {durationMs !== undefined && <Text color="#86868B">  {formatDuration(durationMs)}</Text>}
         </Box>
         {result && (
           <Box marginLeft={2}>
@@ -425,7 +438,9 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
   // Writes with diffs auto-expand like edits.
   const hasDiff = lang === "diff";
   const collapseByDefault = category === "read" || (category === "write" && !hasDiff) || category === "directory";
-  const showFull = hasResult && (expanded || (isShort && !collapseByDefault));
+  // Interactive tools (plan mode) always expand to show their content
+  const alwaysExpand = category === "interactive";
+  const showFull = hasResult && (expanded || alwaysExpand || (isShort && !collapseByDefault));
 
   return (
     <Box flexDirection="column">
@@ -434,11 +449,11 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
         <Text color="#30D158">✓</Text>
         <Text color={catStyle.color}> {catStyle.icon}</Text>
         <Text color={catStyle.color} bold> {getDisplayName(name)}</Text>
-        {context ? <Text dimColor>  {context}</Text> : null}
+        {context ? <Text color="#86868B">  {context}</Text> : null}
         {durationMs !== undefined && (
           durationMs > 3000
             ? <Text color="#FF9F0A">  {formatDuration(durationMs)}</Text>
-            : <Text dimColor>  {formatDuration(durationMs)}</Text>
+            : <Text color="#86868B">  {formatDuration(durationMs)}</Text>
         )}
         {/* Inline summary badges — edits only (writes use tree line below) */}
         {summary?.type === "edit" && category === "edit" && (
@@ -448,23 +463,23 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           </>
         )}
         {summary?.type === "search" && (
-          <Text dimColor>  {summary.matches} match{summary.matches !== 1 ? "es" : ""}{summary.files > 0 ? ` in ${summary.files} file${summary.files !== 1 ? "s" : ""}` : ""}</Text>
+          <Text color="#86868B">  {summary.matches} match{summary.matches !== 1 ? "es" : ""}{summary.files > 0 ? ` in ${summary.files} file${summary.files !== 1 ? "s" : ""}` : ""}</Text>
         )}
         {(summary?.type === "read" || summary?.type === "write" || summary?.type === "command" || summary?.type === "directory" || summary?.type === "web") && (
-          <Text dimColor>  {(summary as any).label}</Text>
+          <Text color="#86868B">  {(summary as any).label}</Text>
         )}
         {summary?.type === "server" && (
           <Text color="#64D2FF">  {(summary as any).label}</Text>
         )}
-        {!summary && hasResult && !showFull && <Text dimColor>  {lineCount} lines</Text>}
+        {!summary && hasResult && !showFull && <Text color="#86868B">  {lineCount} lines</Text>}
       </Box>
 
       {/* Write diff summary tree line */}
       {category === "write" && hasDiff && summary?.type === "edit" && (
         <Box marginLeft={2}>
-          <Text dimColor>└ Added </Text><Text color="#30D158">{summary.added}</Text>
-          <Text dimColor> lines, removed </Text><Text color="#FF453A">{summary.removed}</Text>
-          <Text dimColor> lines</Text>
+          <Text color="#6E6E73">└ Added </Text><Text color="#30D158">{summary.added}</Text>
+          <Text color="#6E6E73"> lines, removed </Text><Text color="#FF453A">{summary.removed}</Text>
+          <Text color="#6E6E73"> lines</Text>
         </Box>
       )}
 
@@ -487,7 +502,7 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
             lang,
             filePath
           )} />
-          <Text dimColor>  └ +{lineCount - PREVIEW_LINES} lines  ^E</Text>
+          <Text color="#6E6E73">  └ +{lineCount - PREVIEW_LINES} lines  ^E</Text>
         </Box>
       )}
     </Box>
