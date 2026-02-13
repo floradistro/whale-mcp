@@ -31,6 +31,7 @@ import { spawnTeammate, TeammateMessage } from "./teammate.js";
 import { logSpan, generateTraceId, generateSpanId, createTurnContext, getConversationId } from "./telemetry.js";
 import { resolveConfig } from "./config-store.js";
 import { getGlobalEmitter } from "./agent-events.js";
+import { getModelShortName } from "./agent-loop.js";
 
 // ============================================================================
 // TYPES
@@ -177,7 +178,7 @@ export class TeamLead extends EventEmitter {
         team_name: config.name,
         teammate_count: config.teammateCount,
         task_count: config.tasks.length,
-        model: config.model || "sonnet",
+        model: config.model || getModelShortName(),
         // Display metadata
         display_name: `Team: ${config.name}`,
         display_icon: "person.3.fill",
@@ -214,7 +215,7 @@ export class TeamLead extends EventEmitter {
     saveTeam(freshTeam);
 
     // Create teammates with meaningful names
-    const model = config.model || "sonnet";
+    const model = config.model || getModelShortName();
 
     // Generate teammate names from tasks if not provided
     const teammateNames = config.teammateNames || this.generateTeammateNames(config.tasks, config.teammateCount);

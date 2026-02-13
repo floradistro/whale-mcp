@@ -74,8 +74,15 @@ function formatContext(name: string, input?: Record<string, unknown>): string {
     return input.path ? shortenPath(String(input.path)) : "";
   }
   if (name === "run_command") {
-    const cmd = String(input.command || "");
-    return cmd.length > 50 ? cmd.slice(0, 47) + "…" : cmd;
+    let cmd = String(input.command || "");
+    // Mask passwords/secrets in display
+    cmd = cmd.replace(/(?:PASSWORD|SECRET|TOKEN|KEY)=['"][^'"]*['"]/gi, (m) => {
+      const eq = m.indexOf("=");
+      return m.slice(0, eq + 1) + "'••••'";
+    });
+    // Adaptive truncation — fit within one terminal line
+    const maxCtx = Math.min(60, Math.max(20, (process.stdout.columns || 80) - 40));
+    return cmd.length > maxCtx ? cmd.slice(0, maxCtx - 1) + "…" : cmd;
   }
   if (name === "search_files") {
     const parts = [input.pattern, input.path ? shortenPath(String(input.path)) : null].filter(Boolean);
@@ -506,7 +513,7 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
             lang,
             filePath
           )} />
-          <Text color="#6E6E73">  └ +{lineCount - PREVIEW_LINES} lines  ^E</Text>
+          <Text color="#48484A">    └ +{lineCount - PREVIEW_LINES} lines  </Text><Text color="#636366" dimColor>^E</Text>
         </Box>
       )}
     </Box>

@@ -87,7 +87,7 @@ const MODEL_MAP: Record<string, string> = {
   "haiku":   "claude-haiku-4-5-20251001",
 };
 
-let activeModel = "claude-sonnet-4-20250514";
+let activeModel = "claude-opus-4-6";
 
 export function setModel(name: string): { success: boolean; model: string } {
   const key = name.toLowerCase().replace(/^claude-?/, "").replace(/-.*/, "");
@@ -302,7 +302,7 @@ function getContextManagement(model: string): { betas: string[]; config: { edits
   if (model.includes("opus-4-6")) {
     edits.push({
       type: "compact_20260112" as const,
-      trigger: { type: "input_tokens" as const, value: 150_000 },
+      trigger: { type: "input_tokens" as const, value: 120_000 },
     });
     betas.push("compact-2026-01-12");
   }
@@ -310,8 +310,8 @@ function getContextManagement(model: string): { betas: string[]; config: { edits
   // Tool result clearing: supported on all Claude 4+ models
   edits.push({
     type: "clear_tool_uses_20250919" as const,
-    trigger: { type: "input_tokens" as const, value: 100_000 },
-    keep: { type: "tool_uses" as const, value: 5 },
+    trigger: { type: "input_tokens" as const, value: 80_000 },
+    keep: { type: "tool_uses" as const, value: 3 },
   });
 
   return { betas, config: { edits } };
@@ -710,7 +710,11 @@ Consider the reversibility and blast radius of your actions:
 - Use task with run_in_background:true for long-running tasks; check with task_output, stop with task_stop.
 - Do NOT spawn subagents for tasks you can do with a single glob or read_file.
 - Do NOT use team_create for bug fixes or single-file changes — work directly. Teams are for large features with 3+ independent workstreams.
-- Prefer "explore" type for quick codebase searches (2-4 turns). Prefer "general-purpose" for autonomous multi-step tasks.`;
+- Prefer "explore" type for quick codebase searches (2-4 turns). Prefer "general-purpose" for autonomous multi-step tasks.
+- Cost-aware model routing for subagents:
+  - model:"haiku" — file searches, schema lookups, simple reads, pattern matching
+  - model:"sonnet" — code analysis, multi-step research, plan design
+  - Only use model:"opus" for subagents needing complex reasoning (rarely needed)`;
 
   if (hasServerTools) {
     toolSection += `
@@ -905,31 +909,59 @@ async function* parseSSE(
 }
 
 // ============================================================================
+// PROMPT CACHING — multi-breakpoint (up to 4 cache_control markers)
+// ============================================================================
+
+/**
+ * Add prompt cache breakpoints to tools and messages.
+ * Anthropic allows up to 4 breakpoints. We use:
+ * 1. System prompt (handled separately in API call)
+ * 2. Last tool definition (stable across turns)
+ * 3. Turn boundary (second-to-last message — everything before is unchanged)
+ */
+function addPromptCaching(
+  tools: Anthropic.Tool[],
+  messages: Anthropic.MessageParam[]
+): { tools: any[]; messages: any[] } {
+  // Cache breakpoint 2: last tool definition
+  const cachedTools: any[] = tools.length > 0
+    ? [...tools.slice(0, -1), { ...tools[tools.length - 1], cache_control: { type: "ephemeral" } }]
+    : [...tools];
+
+  // Cache breakpoint 3: turn boundary (second-to-last message)
+  const cachedMessages = [...messages];
+  if (cachedMessages.length >= 2) {
+    const idx = cachedMessages.length - 2;
+    const msg = cachedMessages[idx];
+    if (typeof msg.content === "string") {
+      cachedMessages[idx] = {
+        ...msg,
+        content: [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }],
+      };
+    } else if (Array.isArray(msg.content)) {
+      const blocks = [...(msg.content as any[])];
+      blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: { type: "ephemeral" } };
+      cachedMessages[idx] = { ...msg, content: blocks };
+    }
+  }
+
+  return { tools: cachedTools, messages: cachedMessages };
+}
+
+// ============================================================================
 // STREAM VIA DIRECT ANTHROPIC (fallback when proxy unavailable)
 // ============================================================================
 
 async function* streamDirect(
   apiKey: string,
-  messages: Anthropic.MessageParam[],
-  tools: Anthropic.Tool[],
-  systemPrompt: string,
+  messages: any[],
+  tools: any[],
+  system: any[],
   signal?: AbortSignal
 ): AsyncGenerator<any> {
   const anthropic = new Anthropic({ apiKey });
   const maxTokens = getMaxOutputTokens();
 
-  // Use cache_control on system prompt to enable prompt caching (90% savings on cache hits)
-  const system = [
-    {
-      type: "text" as const,
-      text: systemPrompt,
-      cache_control: { type: "ephemeral" as const },
-    },
-  ];
-
-  // Beta API with server-side context management (model-aware):
-  // - compact_20260112: auto-summarizes when input exceeds 150K tokens (Opus 4.6 only)
-  // - clear_tool_uses_20250919: clears old tool results when input exceeds 100K tokens (all Claude 4+)
   const ctxMgmt = getContextManagement(activeModel);
   const stream = await anthropic.beta.messages.create({
     model: activeModel,
@@ -1087,8 +1119,20 @@ async function getEventStream(
   messages: Anthropic.MessageParam[],
   tools: Anthropic.Tool[],
   systemPrompt: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  costContext?: string
 ): Promise<AsyncGenerator<any>> {
+  // Multi-breakpoint prompt caching (tools + turn boundary)
+  const { tools: cachedTools, messages: cachedMessages } = addPromptCaching(tools, messages);
+
+  // System prompt: cached block + optional dynamic cost context (after cache breakpoint)
+  const system: any[] = [
+    { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
+  ];
+  if (costContext) {
+    system.push({ type: "text", text: costContext });
+  }
+
   // Try proxy with JWT
   const token = await getValidToken();
   if (token) {
@@ -1100,9 +1144,9 @@ async function getEventStream(
           "Authorization": `Bearer ${token}`,
         },
         body: JSON.stringify({
-          messages,
-          system: systemPrompt,
-          tools,
+          messages: cachedMessages,
+          system,
+          tools: cachedTools,
           model: activeModel,
           max_tokens: getMaxOutputTokens(),
           stream: true,
@@ -1132,7 +1176,7 @@ async function getEventStream(
   // Fallback: direct Anthropic (if user has API key)
   const apiKey = process.env.ANTHROPIC_API_KEY || loadConfig().anthropic_api_key;
   if (apiKey) {
-    return streamDirect(apiKey, messages, tools, systemPrompt, signal);
+    return streamDirect(apiKey, cachedMessages, cachedTools, system, signal);
   }
 
   throw new Error(
@@ -1250,11 +1294,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       const apiStart = Date.now();
       const apiSpanId = generateSpanId(); // Unique span ID for this API call — tools reference as parent
 
+      // Dynamic cost context (placed after cached system prompt so it doesn't break prefix caching)
+      const costContext = `Session cost: $${sessionCostUsd.toFixed(2)}${opts.maxBudgetUsd ? ` | Budget remaining: $${(opts.maxBudgetUsd - sessionCostUsd).toFixed(2)}` : ""}`;
+
       // Get streaming events with retry logic
       let result: StreamResult | null = null;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
-          const events = await getEventStream(messages, tools, systemPrompt, abortSignal);
+          const events = await getEventStream(messages, tools, systemPrompt, abortSignal, costContext);
           result = await processStreamEvents(events, callbacks, abortSignal, emitter);
           break; // Success
         } catch (err: any) {
@@ -1527,7 +1574,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         } else {
           // Cap tool result content sent to Claude (~30K chars ≈ 7.5K tokens).
           // Prevents massive JSON responses (e.g. raw DB dumps) from blowing context.
-          const MAX_TOOL_RESULT_CHARS = 30_000;
+          const MAX_TOOL_RESULT_CHARS = opts.effort === "low" ? 10_000 : opts.effort === "high" ? 30_000 : 20_000;
           const rawContent = toolResult.success ? toolResult.output : { error: toolResult.output };
           let contentStr = typeof rawContent === "string" ? rawContent : JSON.stringify(rawContent);
           if (contentStr.length > MAX_TOOL_RESULT_CHARS) {

@@ -30,7 +30,7 @@ import { ToolIndicator } from "./ToolIndicator.js";
 import { SubagentPanel, type SubagentActivityState, type CompletedSubagentInfo } from "./SubagentPanel.js";
 import { TeamPanel } from "./TeamPanel.js";
 import { StreamingText } from "./StreamingText.js";
-import { ChatInput, SLASH_COMMANDS } from "./ChatInput.js";
+import { ChatInput, SLASH_COMMANDS, type ImageAttachment } from "./ChatInput.js";
 import { StoreSelector } from "./StoreSelector.js";
 import { colors, symbols } from "../shared/Theme.js";
 import { loadConfig } from "../services/config-store.js";
@@ -485,9 +485,13 @@ export function ChatApp() {
   }, []);
 
   // ── Send ──
-  const handleSend = useCallback(async (userMessage: string) => {
+  const handleSend = useCallback(async (userMessage: string, images?: ImageAttachment[]) => {
     if (isStreaming) return;
-    setMessages((prev) => [...prev, { role: "user", text: userMessage }]);
+    setMessages((prev) => [...prev, {
+      role: "user",
+      text: userMessage,
+      images: images?.map(img => img.name),
+    }]);
     setStreamingText("");
     setActiveTools([]);
     setSubagentActivity(new Map());
@@ -711,6 +715,7 @@ export function ChatApp() {
 
     await runAgentLoop({
       message: userMessage,
+      images: images?.map(img => ({ base64: img.base64, mediaType: img.mediaType })),
       conversationHistory: conversationRef.current,
       abortSignal: abort.signal,
       emitter,

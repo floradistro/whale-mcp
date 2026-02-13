@@ -479,7 +479,7 @@ async function processStream(body: ReadableStream<Uint8Array>): Promise<{
 
 async function runTeammateLoop(data: TeammateWorkerData): Promise<void> {
   const { teamId, teammateId, teammateName, model, cwd, parentConversationId, teamName, authToken } = data;
-  const modelId = MODEL_MAP[model] || MODEL_MAP.sonnet;
+  const modelId = MODEL_MAP[model] || MODEL_MAP.opus;  // Inherit parent default
   const startTime = Date.now();
 
   // Initialize telemetry client with auth token if provided

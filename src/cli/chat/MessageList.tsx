@@ -28,6 +28,7 @@ export interface ToolCall {
 export interface ChatMessage {
   role: "user" | "assistant";
   text: string;
+  images?: string[]; // Image file names attached to user messages
   toolCalls?: ToolCall[];
   completedSubagents?: CompletedSubagentInfo[];
   usage?: { input_tokens: number; output_tokens: number };
@@ -111,10 +112,24 @@ export const CompletedMessage = React.memo(function CompletedMessage({ msg, inde
         </>
       )}
       {msg.role === "user" ? (
-        <Text>
-          <Text color={colors.brand} bold>{symbols.user} </Text>
-          <Text color={colors.user}>{msg.text}</Text>
-        </Text>
+        <Box flexDirection="column">
+          {msg.images && msg.images.length > 0 && (
+            <Box marginLeft={2}>
+              {msg.images.map((name, i) => (
+                <Text key={i}>
+                  <Text color="#5E5CE6">[</Text>
+                  <Text color="#A0A0A8">{name}</Text>
+                  <Text color="#5E5CE6">]</Text>
+                  <Text> </Text>
+                </Text>
+              ))}
+            </Box>
+          )}
+          <Text>
+            <Text color={colors.brand} bold>{symbols.user} </Text>
+            <Text color={colors.user}>{msg.text}</Text>
+          </Text>
+        </Box>
       ) : (
         <Box flexDirection="column">
           {/* Tool calls — consecutive identical calls collapsed with × N count */}

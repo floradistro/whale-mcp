@@ -26,7 +26,7 @@ import {
   executeServerTool,
 } from "./server-tools.js";
 import { createTurnContext, logSpan, generateSpanId, generateTraceId, getTurnNumber } from "./telemetry.js";
-import { loadClaudeMd, classifyToolError } from "./agent-loop.js";
+import { loadClaudeMd, classifyToolError, getModel } from "./agent-loop.js";
 import { getGlobalEmitter } from "./agent-events.js";
 import { getAgentDefinition } from "./agent-definitions.js";
 
@@ -364,6 +364,12 @@ function getAgentColor(type: SubagentType): string {
 
 const PROXY_URL = `${SUPABASE_URL}/functions/v1/agent-proxy`;
 
+/** Add cache_control to last tool definition for prompt caching */
+function addSubagentToolCaching(tools: Anthropic.Tool[]): any[] {
+  if (tools.length === 0) return tools;
+  return [...tools.slice(0, -1), { ...tools[tools.length - 1], cache_control: { type: "ephemeral" } }];
+}
+
 interface ProxyResponse {
   content: Anthropic.ContentBlock[];
   usage: { input_tokens: number; output_tokens: number };
@@ -394,8 +400,8 @@ async function callAPI(
         },
         body: JSON.stringify({
           messages,
-          system: systemPrompt,
-          tools,
+          system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+          tools: addSubagentToolCaching(tools),
           model: modelId,
           max_tokens: MAX_OUTPUT_TOKENS,
           stream: true, // Streaming keeps UI responsive
@@ -404,8 +410,8 @@ async function callAPI(
             edits: [
               {
                 type: "clear_tool_uses_20250919",
-                trigger: { type: "input_tokens", value: 80_000 },
-                keep: { type: "tool_uses", value: 3 },
+                trigger: { type: "input_tokens", value: 60_000 },
+                keep: { type: "tool_uses", value: 2 },
               },
             ],
           },
@@ -545,20 +551,24 @@ async function callAPIDirectStreaming(
   let stopReason = "end_turn";
   let eventCount = 0;
 
-  // Beta API with tool result clearing — prevents old tool results from filling context
+  // System prompt with cache_control for prompt caching + tool result clearing
+  const system = [
+    { type: "text" as const, text: systemPrompt, cache_control: { type: "ephemeral" as const } },
+  ];
+
   const stream = client.beta.messages.stream({
     model: modelId,
     max_tokens: MAX_OUTPUT_TOKENS,
-    system: systemPrompt,
-    tools: tools as any,
+    system: system as any,
+    tools: addSubagentToolCaching(tools) as any,
     messages: messages as any,
     betas: ["context-management-2025-06-27"],
     context_management: {
       edits: [
         {
           type: "clear_tool_uses_20250919" as const,
-          trigger: { type: "input_tokens" as const, value: 80_000 },
-          keep: { type: "tool_uses" as const, value: 3 },
+          trigger: { type: "input_tokens" as const, value: 60_000 },
+          keep: { type: "tool_uses" as const, value: 2 },
         },
       ],
     },
@@ -643,10 +653,11 @@ function yieldForRender(): Promise<void> {
 }
 
 export async function runSubagent(options: SubagentOptions): Promise<SubagentResult> {
-  const { prompt, subagent_type, model = "sonnet", resume, max_turns, name, parentContext, parentTraceContext } = options;
+  const { prompt, subagent_type, model, resume, max_turns, name, parentContext, parentTraceContext } = options;
 
   const agentId = resume || generateAgentId();
-  const modelId = MODEL_MAP[model] || MODEL_MAP.sonnet;
+  // Inherit parent model when not specified (Anthropic pattern)
+  const modelId = model ? MODEL_MAP[model] : getModel();
   const cwd = process.cwd();
   const systemPrompt = buildAgentPrompt(subagent_type, cwd);
   const startTime = Date.now();
@@ -660,7 +671,7 @@ export async function runSubagent(options: SubagentOptions): Promise<SubagentRes
 
   // Emit subagent start event
   const emitter = getGlobalEmitter();
-  emitter.emitSubagentStart(agentId, subagent_type, model, shortDescription);
+  emitter.emitSubagentStart(agentId, subagent_type, model || "inherited", shortDescription);
 
   // Load or create agent state
   let state = resume ? loadAgentState(resume) : null;
@@ -1052,7 +1063,7 @@ Each agent has explicit stop conditions and will complete, not loop.`,
       model: {
         type: "string",
         enum: ["sonnet", "opus", "haiku"],
-        description: "Haiku for simple lookups, Sonnet (default) for most, Opus for complex reasoning.",
+        description: "Optional model override. If not specified, inherits from parent. Prefer haiku for quick, straightforward tasks to minimize cost and latency.",
       },
       resume: {
         type: "string",

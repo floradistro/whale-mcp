@@ -78,6 +78,26 @@ function hyperlink(url: string, text?: string): string {
 }
 
 // ============================================================================
+// Path helpers
+// ============================================================================
+
+/** Shorten a file path for code block headers */
+function shortenPathForHeader(fullPath: string, maxLen = 40): string {
+  let p = fullPath;
+  const cwd = process.cwd();
+  const home = process.env.HOME || "";
+  if (p.startsWith(cwd + "/")) p = p.slice(cwd.length + 1);
+  else if (p.startsWith(cwd)) p = p.slice(cwd.length);
+  else if (home && p.startsWith(home)) p = "~" + p.slice(home.length);
+  if (p.length <= maxLen) return p;
+  const parts = p.split("/");
+  const file = parts.pop()!;
+  if (file.length >= maxLen - 4) return "…/" + file.slice(-(maxLen - 4));
+  const parent = parts.pop();
+  return parent ? "…/" + parent + "/" + file : "…/" + file;
+}
+
+// ============================================================================
 // Syntax highlighting — purples / blues / pinks
 // ============================================================================
 
@@ -662,41 +682,72 @@ marked.use({
         return renderDiff(code);
       }
       {
+        // Command output mode: bash without subtitle = run_command output
+        // → no line numbers, wider content area, clean indent
+        const isCommandOutput = (lang === "bash" || lang === "terminal") && !subtitle;
+        const highlightLang = lang === "terminal" ? "bash" : lang;
+
         // Build header: ── lang ── subtitle ──────
+        const termWidth = process.stdout.columns || 80;
+        const headerWidth = Math.max(20, termWidth - 6);
+        const displayLang = isCommandOutput ? "bash" : lang;
         let header: string;
-        if (lang && subtitle) {
-          const pad = Math.max(2, 44 - lang.length - subtitle.length);
-          header = separator("  ── ") + tertiary(lang) + separator(" ── ") + secondary(subtitle) + separator(` ${"─".repeat(pad)}`);
-        } else if (lang) {
-          header = separator("  ── ") + tertiary(lang) + separator(` ${"─".repeat(Math.max(2, 46 - lang.length))}`);
+        if (displayLang && subtitle) {
+          const shortSub = shortenPathForHeader(subtitle, headerWidth - displayLang.length - 10);
+          const pad = Math.max(2, headerWidth - displayLang.length - shortSub.length - 6);
+          header = separator("  ── ") + tertiary(displayLang) + separator(" ── ") + secondary(shortSub) + separator(` ${"─".repeat(pad)}`);
+        } else if (displayLang) {
+          const pad = Math.max(2, headerWidth - displayLang.length - 3);
+          header = separator("  ── ") + tertiary(displayLang) + separator(` ${"─".repeat(pad)}`);
         } else {
-          // No lang — minimal header
-          header = separator("  ── ") + separator("─".repeat(46));
+          header = separator("  ──" + "─".repeat(headerWidth - 2));
         }
+
+        // Calculate max line width to prevent wrapping
+        const lineCount = code.split("\n").length;
+        const gutterW = isCommandOutput ? 0 : String(lineCount).length;
+        const gutterOverhead = isCommandOutput ? 4 : (2 + gutterW + 3); // "    " or "  123 │ "
+        const maxLineWidth = Math.max(20, termWidth - gutterOverhead - 2);
+
+        // Pre-truncate lines BEFORE highlighting (avoids cutting ANSI codes)
+        const truncatedCode = code.split("\n").map((line: string) => {
+          if (line.length > maxLineWidth) {
+            return line.slice(0, maxLineWidth - 1) + "…";
+          }
+          return line;
+        }).join("\n");
+
         let highlighted: string;
-        if (lang) {
+        if (highlightLang) {
           try {
-            // Suppress cli-highlight warnings (e.g. "Could not find the language")
             const origWarn = console.warn;
             console.warn = () => {};
             try {
-              highlighted = highlight(code, { language: lang, ignoreIllegals: true, theme: appleTheme });
+              highlighted = highlight(truncatedCode, { language: highlightLang, ignoreIllegals: true, theme: appleTheme });
             } finally {
               console.warn = origWarn;
             }
           } catch {
-            highlighted = code;
+            highlighted = truncatedCode;
           }
         } else {
-          highlighted = code;
+          highlighted = truncatedCode;
         }
+
         const hLines = highlighted.split("\n");
-        const gutterW = String(hLines.length).length;
-        const numbered = hLines.map((l, i) => {
-          const num = tertiary(String(i + 1).padStart(gutterW));
-          return "  " + num + separator(" │ ") + l;
-        }).join("\n");
-        return "\n" + header + "\n" + numbered + "\n";
+
+        if (isCommandOutput) {
+          // Command output: no line numbers, 4-space indent
+          const body = hLines.map(l => "    " + l).join("\n");
+          return "\n" + header + "\n" + body + "\n";
+        } else {
+          // Code with line numbers + gutter
+          const numbered = hLines.map((l, i) => {
+            const num = tertiary(String(i + 1).padStart(gutterW));
+            return "  " + num + separator(" │ ") + l;
+          }).join("\n");
+          return "\n" + header + "\n" + numbered + "\n";
+        }
       }
     },
     table(this: any, token: any) {
