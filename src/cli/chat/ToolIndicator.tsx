@@ -34,6 +34,8 @@ interface ToolIndicatorProps {
   input?: Record<string, unknown>;
   durationMs?: number;
   expanded?: boolean;
+  /** When > 1, shows a "× N" badge and hides result (collapsed duplicate group) */
+  count?: number;
 }
 
 // ============================================================================
@@ -289,7 +291,7 @@ function wrapInFence(content: string, lang: string, subtitle?: string): string {
 // COMPONENT
 // ============================================================================
 
-export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, status, result, input, durationMs, expanded = false }: ToolIndicatorProps) {
+export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, status, result, input, durationMs, expanded = false, count }: ToolIndicatorProps) {
   const context = useMemo(() => formatContext(name, input), [name, input]);
   const lineCount = useMemo(() => result ? result.split("\n").length : 0, [result]);
   // Detect lang — writes with diffs get "diff" treatment
@@ -440,7 +442,8 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
   const collapseByDefault = category === "read" || (category === "write" && !hasDiff) || category === "directory";
   // Interactive tools (plan mode) always expand to show their content
   const alwaysExpand = category === "interactive";
-  const showFull = hasResult && (expanded || alwaysExpand || (isShort && !collapseByDefault));
+  const isGrouped = (count ?? 0) > 1;
+  const showFull = hasResult && !isGrouped && (expanded || alwaysExpand || (isShort && !collapseByDefault));
 
   return (
     <Box flexDirection="column">
@@ -472,6 +475,7 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
           <Text color="#64D2FF">  {(summary as any).label}</Text>
         )}
         {!summary && hasResult && !showFull && <Text color="#86868B">  {lineCount} lines</Text>}
+        {(count ?? 0) > 1 && <Text color="#86868B" dimColor>  × {count}</Text>}
       </Box>
 
       {/* Write diff summary tree line */}
@@ -495,7 +499,7 @@ export const ToolIndicator = React.memo(function ToolIndicator({ id: _id, name, 
       )}
 
       {/* Preview for long results (edit/search/command only — reads stay fully collapsed) */}
-      {hasResult && !showFull && !collapseByDefault && (
+      {hasResult && !showFull && !collapseByDefault && !isGrouped && (
         <Box flexDirection="column" marginLeft={2}>
           <MarkdownText text={wrapInFence(
             (category === "search" ? formatSearchResult(result!) : result!).split("\n").slice(0, PREVIEW_LINES).join("\n"),

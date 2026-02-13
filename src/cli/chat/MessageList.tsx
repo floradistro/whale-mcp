@@ -61,6 +61,36 @@ function formatMs(ms: number): string {
 }
 
 // ============================================================================
+// TOOL CALL GROUPING — collapse consecutive identical tool calls
+// ============================================================================
+
+interface ToolCallGroup {
+  tool: ToolCall;
+  count: number;
+}
+
+/**
+ * Group consecutive tool calls with the same name and input into groups.
+ * Identical consecutive calls collapse into one entry with count > 1.
+ */
+function groupConsecutiveTools(toolCalls: ToolCall[]): ToolCallGroup[] {
+  const groups: ToolCallGroup[] = [];
+  for (const tc of toolCalls) {
+    const key = tc.name + "|" + JSON.stringify(tc.input || {});
+    const last = groups[groups.length - 1];
+    if (last) {
+      const lastKey = last.tool.name + "|" + JSON.stringify(last.tool.input || {});
+      if (lastKey === key && last.tool.status === tc.status) {
+        last.count++;
+        continue;
+      }
+    }
+    groups.push({ tool: tc, count: 1 });
+  }
+  return groups;
+}
+
+// ============================================================================
 // COMPLETED MESSAGE — memoized, never re-renders during streaming
 // ============================================================================
 
@@ -87,19 +117,20 @@ export const CompletedMessage = React.memo(function CompletedMessage({ msg, inde
         </Text>
       ) : (
         <Box flexDirection="column">
-          {/* Tool calls */}
+          {/* Tool calls — consecutive identical calls collapsed with × N count */}
           {msg.toolCalls && msg.toolCalls.length > 0 && (
             <Box flexDirection="column" marginLeft={2}>
-              {msg.toolCalls.map((tc, j) => (
+              {groupConsecutiveTools(msg.toolCalls).map((group, j) => (
                 <ToolIndicator
                   key={j}
                   id={`done-${index}-${j}`}
-                  name={tc.name}
-                  status={tc.status}
-                  result={tc.result}
-                  input={tc.input}
-                  durationMs={tc.durationMs}
+                  name={group.tool.name}
+                  status={group.tool.status}
+                  result={group.tool.result}
+                  input={group.tool.input}
+                  durationMs={group.tool.durationMs}
                   expanded={toolsExpanded}
+                  count={group.count}
                 />
               ))}
             </Box>

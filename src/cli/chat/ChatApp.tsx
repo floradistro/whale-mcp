@@ -20,6 +20,7 @@ import {
   addMemory, removeMemory, listMemories,
   setPermissionMode, getPermissionMode, type PermissionMode,
 } from "../services/agent-loop.js";
+import { setConversationId } from "../services/telemetry.js";
 import { getAllServerToolDefinitions, resetServerToolClient } from "../services/server-tools.js";
 import { LOCAL_TOOL_DEFINITIONS, loadTodos, setTodoSessionId } from "../services/local-tools.js";
 import { loadAgentDefinitions } from "../services/agent-definitions.js";
@@ -338,6 +339,7 @@ export function ChatApp() {
           if (loaded) {
             conversationRef.current = loaded.messages;
             setSessionId(latest.id);
+            setConversationId(latest.id);
             setTodoSessionId(latest.id);
             loadTodos(latest.id);
             if (loaded.meta.model) setModel(loaded.meta.model);
@@ -742,12 +744,17 @@ export function ChatApp() {
           // Remove from running tools
           const idx = toolCalls.findIndex((t) => t.name === name && t.status === "running");
           if (idx >= 0) toolCalls.splice(idx, 1);
-          // Commit completed tool to the permanent message feed
-          setMessages(prev => [...prev, {
-            role: "assistant" as const,
-            text: "",
-            toolCalls: [completedTool],
-          }]);
+          // Batch: append to last message if it's a tool-only assistant message (no text, no usage).
+          // This groups parallel tool calls from one API response into a single message,
+          // preventing spammy duplicate rows when the model requests many similar tools.
+          setMessages(prev => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && !last.text && !last.usage && last.toolCalls?.length) {
+              const updated = { ...last, toolCalls: [...last.toolCalls, completedTool] };
+              return [...prev.slice(0, -1), updated];
+            }
+            return [...prev, { role: "assistant" as const, text: "", toolCalls: [completedTool] }];
+          });
           setActiveTools([...toolCalls]);
           // Reset streaming text for next chunk
           accTextRef.current = "";
