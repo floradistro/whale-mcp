@@ -22,6 +22,7 @@ import {
   type AgentLoopCallbacks,
   type AgentLoopOptions,
 } from "./services/agent-loop.js";
+import { setConversationId } from "./services/telemetry.js";
 
 // ============================================================================
 // TYPES
@@ -65,6 +66,7 @@ export async function runPrintMode(opts: PrintModeOptions): Promise<number> {
     const session = loadSession(opts.resumeSessionId);
     if (session) {
       conversationHistory = session.messages;
+      setConversationId(opts.resumeSessionId);
       if (opts.verbose) {
         process.stderr.write(`Resuming session ${opts.resumeSessionId} (${session.meta.messageCount} messages)\n`);
       }
@@ -78,6 +80,7 @@ export async function runPrintMode(opts: PrintModeOptions): Promise<number> {
       const session = loadSession(latest.id);
       if (session) {
         conversationHistory = session.messages;
+        setConversationId(latest.id);
         if (opts.verbose) {
           process.stderr.write(`Continuing session ${latest.id}\n`);
         }

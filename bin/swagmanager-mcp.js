@@ -51,6 +51,9 @@ try {
       "disallowed-tools":     { type: "string" },
       // Fallback
       "fallback-model":       { type: "string" },
+      // Serve mode
+      port:                   { type: "string" },
+      host:                   { type: "string" },
       // Debug / verbose
       debug:                  { type: "boolean" },
       verbose:                { type: "boolean", short: "v" },
@@ -100,6 +103,7 @@ function showHelp() {
   console.log(`    whale mcp${d}              Manage MCP servers${r}`);
   console.log(`    whale doctor${d}           Run diagnostics${r}`);
   console.log(`    whale config${d}           View/set configuration${r}`);
+  console.log(`    whale serve${d}            Local agent WebSocket server${r}`);
   console.log();
   console.log(`  ${B}Print Mode (non-interactive):${r}`);
   console.log(`    whale -p "prompt"${d}      Run single prompt, output to stdout${r}`);
@@ -280,6 +284,16 @@ switch (command) {
   case "config": {
     const { runConfigCommand } = await import(join(distDir, "cli", "commands", "config-cmd.js"));
     await runConfigCommand(positionals.slice(1), flags);
+    break;
+  }
+
+  case "serve": {
+    const { runServeMode } = await import(join(distDir, "cli", "serve-mode.js"));
+    await runServeMode({
+      port: flags.port ? parseInt(flags.port, 10) : 3847,
+      host: flags.host || "127.0.0.1",
+      ...buildOptions(),
+    });
     break;
   }
 

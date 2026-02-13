@@ -140,7 +140,7 @@ export function createTurnContext(overrides?: Partial<ExecutionContext>): Execut
   const { user_id, email } = loadConfig(); // Load user info directly
 
   return {
-    source: "claude_code",
+    source: "whale_cli",
     serviceName: "whale-cli",
     serviceVersion: "2.1.0",
     conversationId,

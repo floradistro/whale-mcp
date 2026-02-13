@@ -298,26 +298,202 @@ export function getSessionTokens(): { input: number; output: number } {
 
 /**
  * Context management config — sent to Anthropic beta API.
- * Server-side compaction and tool result clearing replace our custom compressContext().
+ * Model-aware: compact_20260112 only supported on Opus 4.6.
+ * clear_tool_uses_20250919 supported on all Claude 4+ models.
  */
-const CONTEXT_MANAGEMENT_CONFIG = {
-  edits: [
-    {
+function getContextManagement(model: string): { betas: string[]; config: { edits: any[] } } {
+  const edits: any[] = [];
+  const betas: string[] = ["context-management-2025-06-27"];
+
+  // Compaction: only supported on Opus 4.6
+  if (model.includes("opus-4-6")) {
+    edits.push({
       type: "compact_20260112" as const,
       trigger: { type: "input_tokens" as const, value: 150_000 },
-    },
-    {
-      type: "clear_tool_uses_20250919" as const,
-      trigger: { type: "input_tokens" as const, value: 100_000 },
-      keep: { type: "tool_uses" as const, value: 5 },
-    },
-  ],
-};
+    });
+    betas.push("compact-2026-01-12");
+  }
 
-const CONTEXT_MANAGEMENT_BETAS: string[] = [
-  "compact-2026-01-12",
-  "context-management-2025-06-27",
-];
+  // Tool result clearing: supported on all Claude 4+ models
+  edits.push({
+    type: "clear_tool_uses_20250919" as const,
+    trigger: { type: "input_tokens" as const, value: 100_000 },
+    keep: { type: "tool_uses" as const, value: 5 },
+  });
+
+  return { betas, config: { edits } };
+}
+
+// ============================================================================
+// CLIENT-SIDE COMPACTION — for Sonnet/Haiku (no server-side compact support)
+// ============================================================================
+
+const COMPACTION_SUMMARY_PROMPT = `Summarize this conversation transcript concisely. Preserve:
+- The user's task/goal
+- Key decisions made and reasoning
+- Important file paths, function names, and code snippets
+- Current state of work (what's done, what's remaining)
+- Any errors encountered and how they were resolved
+- Next steps the assistant was about to take
+
+Output your summary inside <summary></summary> tags. Be thorough but concise.`;
+
+/**
+ * Serialize messages into a readable transcript for the compaction summarizer.
+ * Handles text, tool_use, tool_result, and compaction blocks.
+ */
+function serializeMessagesForSummary(messages: Anthropic.MessageParam[]): string {
+  const lines: string[] = [];
+  for (const msg of messages) {
+    const role = msg.role === "user" ? "Human" : "Assistant";
+    if (typeof msg.content === "string") {
+      lines.push(`[${role}]: ${msg.content}`);
+      continue;
+    }
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if ("text" in block && typeof block.text === "string") {
+        lines.push(`[${role}]: ${block.text}`);
+      } else if ("type" in block && block.type === "tool_use") {
+        const tu = block as any;
+        const inputStr = JSON.stringify(tu.input || {}).slice(0, 500);
+        lines.push(`[Called tool: ${tu.name}(${inputStr})]`);
+      } else if ("type" in block && block.type === "tool_result") {
+        const tr = block as any;
+        const content = typeof tr.content === "string"
+          ? tr.content.slice(0, 500)
+          : JSON.stringify(tr.content || "").slice(0, 500);
+        lines.push(`[Tool result]: ${content}`);
+      } else if ("type" in block && (block as any).type === "compaction") {
+        const cb = block as any;
+        if (cb.content) lines.push(`[Previous summary]: ${cb.content}`);
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+interface CompactionResult {
+  compacted: boolean;
+  beforeCount: number;
+  afterCount: number;
+  tokensSaved: number;
+}
+
+/**
+ * Client-side compaction for non-Opus models.
+ * Summarizes conversation history when input tokens exceed threshold.
+ * Non-fatal: catches all errors and returns no-op result.
+ */
+async function maybeCompactClientSide(
+  messages: Anthropic.MessageParam[],
+  model: string,
+): Promise<CompactionResult> {
+  const noOp: CompactionResult = { compacted: false, beforeCount: messages.length, afterCount: messages.length, tokensSaved: 0 };
+
+  // Guard: Opus uses server-side compaction
+  if (model.includes("opus-4-6")) return noOp;
+  // Guard: not enough tokens to warrant compaction
+  if (lastKnownInputTokens < 150_000) return noOp;
+  // Guard: too few messages to compact
+  if (messages.length < 4) return noOp;
+
+  try {
+    const beforeCount = messages.length;
+    // Serialize all but the last 2 messages (preserve recent context)
+    const toSummarize = messages.slice(0, -2);
+    const preserved = messages.slice(-2);
+    let transcript = serializeMessagesForSummary(toSummarize);
+    // Cap transcript to avoid blowing context on the summarization call itself
+    if (transcript.length > 100_000) {
+      transcript = transcript.slice(0, 100_000) + "\n\n... (transcript truncated)";
+    }
+
+    // Make a non-streaming summarization call
+    const apiKey = process.env.ANTHROPIC_API_KEY || loadConfig().anthropic_api_key;
+    let summaryText: string | null = null;
+
+    if (apiKey) {
+      // Direct API call
+      const anthropic = new Anthropic({ apiKey });
+      const resp = await anthropic.messages.create({
+        model,
+        max_tokens: 8192,
+        messages: [
+          { role: "user", content: `${COMPACTION_SUMMARY_PROMPT}\n\n<transcript>\n${transcript}\n</transcript>` },
+        ],
+      });
+      for (const block of resp.content) {
+        if (block.type === "text") {
+          summaryText = block.text;
+          break;
+        }
+      }
+      // Track compaction call tokens
+      sessionInputTokens += resp.usage.input_tokens;
+      sessionOutputTokens += resp.usage.output_tokens;
+    } else {
+      // Proxy fallback (non-streaming)
+      const token = await getValidToken();
+      if (!token) return noOp;
+      const response = await fetch(PROXY_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          messages: [
+            { role: "user", content: `${COMPACTION_SUMMARY_PROMPT}\n\n<transcript>\n${transcript}\n</transcript>` },
+          ],
+          model,
+          max_tokens: 8192,
+          stream: false,
+        }),
+      });
+      if (!response.ok) return noOp;
+      const json = await response.json() as any;
+      for (const block of (json.content || [])) {
+        if (block.type === "text") {
+          summaryText = block.text;
+          break;
+        }
+      }
+      // Track proxy compaction tokens
+      if (json.usage) {
+        sessionInputTokens += json.usage.input_tokens || 0;
+        sessionOutputTokens += json.usage.output_tokens || 0;
+      }
+    }
+
+    if (!summaryText) return noOp;
+
+    // Extract <summary> content
+    const summaryMatch = summaryText.match(/<summary>([\s\S]*?)<\/summary>/);
+    const summary = summaryMatch ? summaryMatch[1].trim() : summaryText.trim();
+    if (!summary) return noOp;
+
+    // Replace messages in-place: [summary user msg] → [ack assistant msg] → [preserved last 2]
+    messages.length = 0;
+    messages.push({
+      role: "user",
+      content: `[This conversation was automatically summarized to save context space]\n\n${summary}`,
+    });
+    messages.push({
+      role: "assistant",
+      content: "Understood. I have the conversation context from the summary. Let me continue where we left off.",
+    });
+    messages.push(...preserved);
+
+    const afterCount = messages.length;
+    // Rough token savings estimate: ~4 tokens per message on average overhead
+    const tokensSaved = Math.max(0, lastKnownInputTokens - 50_000);
+    return { compacted: true, beforeCount, afterCount, tokensSaved };
+  } catch {
+    // Non-fatal: continue with un-compacted messages
+    return noOp;
+  }
+}
 
 // ============================================================================
 // GIT CONTEXT — gather branch, status, recent commits for system prompt
@@ -691,9 +867,10 @@ async function* streamDirect(
     },
   ];
 
-  // Beta API with server-side context management:
-  // - compact_20260112: auto-summarizes when input exceeds 150K tokens
-  // - clear_tool_uses_20250919: clears old tool results when input exceeds 100K tokens (keeps last 5)
+  // Beta API with server-side context management (model-aware):
+  // - compact_20260112: auto-summarizes when input exceeds 150K tokens (Opus 4.6 only)
+  // - clear_tool_uses_20250919: clears old tool results when input exceeds 100K tokens (all Claude 4+)
+  const ctxMgmt = getContextManagement(activeModel);
   const stream = await anthropic.beta.messages.create({
     model: activeModel,
     max_tokens: maxTokens,
@@ -701,8 +878,8 @@ async function* streamDirect(
     tools: tools as any,
     messages: messages as any,
     stream: true,
-    betas: CONTEXT_MANAGEMENT_BETAS,
-    context_management: CONTEXT_MANAGEMENT_CONFIG,
+    betas: ctxMgmt.betas,
+    context_management: ctxMgmt.config,
   });
 
   for await (const event of stream) {
@@ -869,8 +1046,8 @@ async function getEventStream(
           model: activeModel,
           max_tokens: getMaxOutputTokens(),
           stream: true,
-          betas: CONTEXT_MANAGEMENT_BETAS,
-          context_management: CONTEXT_MANAGEMENT_CONFIG,
+          betas: getContextManagement(activeModel).betas,
+          context_management: getContextManagement(activeModel).config,
         }),
         signal,
       });
@@ -958,10 +1135,28 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
 
   try {
     for (let iteration = 0; iteration < effectiveMaxTurns; iteration++) {
-      if (abortSignal?.aborted) { callbacks.onError("Cancelled", messages); return; }
+      if (abortSignal?.aborted) {
+        logSpan({
+          action: "chat.cancelled",
+          durationMs: Date.now() - sessionStart,
+          context: turnCtx,
+          storeId: storeId || undefined,
+          details: { iteration, reason: "user_abort" },
+        });
+        callbacks.onError("Cancelled", messages);
+        return;
+      }
 
       // Budget enforcement
       if (opts.maxBudgetUsd && sessionCostUsd >= opts.maxBudgetUsd) {
+        logSpan({
+          action: "chat.budget_exceeded",
+          durationMs: Date.now() - sessionStart,
+          context: turnCtx,
+          storeId: storeId || undefined,
+          severity: "warn",
+          details: { session_cost_usd: sessionCostUsd, max_budget_usd: opts.maxBudgetUsd, iteration },
+        });
         callbacks.onError(`Budget exceeded: $${sessionCostUsd.toFixed(4)} >= $${opts.maxBudgetUsd}`, messages);
         return;
       }
@@ -1046,6 +1241,30 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             iteration,
           },
         });
+      }
+
+      // Client-side compaction for non-Opus models (Sonnet/Haiku)
+      if (!activeModel.includes("opus-4-6") && lastKnownInputTokens >= 150_000 && messages.length >= 4) {
+        const compactResult = await maybeCompactClientSide(messages, activeModel);
+        if (compactResult.compacted) {
+          callbacks.onAutoCompact?.(compactResult.beforeCount, compactResult.afterCount, compactResult.tokensSaved);
+          emitter?.emitCompact(compactResult.beforeCount, compactResult.afterCount, compactResult.tokensSaved);
+
+          logSpan({
+            action: "chat.client_compaction",
+            durationMs: 0,
+            context: turnCtx,
+            storeId: storeId || undefined,
+            details: {
+              type: "client_side",
+              model: activeModel,
+              before_messages: compactResult.beforeCount,
+              after_messages: compactResult.afterCount,
+              tokens_saved: compactResult.tokensSaved,
+              iteration,
+            },
+          });
+        }
       }
 
       // Collect assistant text for telemetry
@@ -1173,8 +1392,22 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             },
           });
         } else if (isServerTool(tu.name)) {
-          // Server tools proxied to edge function — single source of truth.
           toolResult = await executeServerTool(tu.name, tu.input);
+
+          logSpan({
+            action: `tool.${tu.name}`,
+            durationMs: Date.now() - toolStart,
+            context: { ...turnCtx, parentSpanId: apiSpanId },
+            storeId: storeId || undefined,
+            error: toolResult.success ? undefined : String(toolResult.output),
+            details: {
+              tool_type: "server",
+              tool_input: tu.input,
+              tool_result: truncateResult(toolResult.output, 2000),
+              error_type: toolResult.success ? undefined : classifyToolError(toolResult.output),
+              iteration,
+            },
+          });
         } else {
           toolResult = { success: false, output: `Unknown tool: ${tu.name}` };
         }
@@ -1321,6 +1554,22 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
     const errorMsg = abortSignal?.aborted || err?.message === "Cancelled"
       ? "Cancelled"
       : String(err?.message || err);
+
+    // Log fatal error to telemetry
+    logSpan({
+      action: errorMsg === "Cancelled" ? "chat.cancelled" : "chat.fatal_error",
+      durationMs: Date.now() - sessionStart,
+      context: { ...turnCtx, inputTokens: totalIn, outputTokens: totalOut, model: activeModel },
+      storeId: storeId || undefined,
+      severity: errorMsg === "Cancelled" ? "info" : "error",
+      error: errorMsg === "Cancelled" ? undefined : errorMsg,
+      details: {
+        input_tokens: totalIn,
+        output_tokens: totalOut,
+        session_cost_usd: sessionCostUsd,
+        model: activeModel,
+      },
+    });
 
     // Emit error event and clean up
     emitter?.emitError(errorMsg);

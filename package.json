@@ -22,9 +22,10 @@
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
     "marked": "^15.0.12",
-    "pdf-parse": "^1.1.1",
     "marked-terminal": "^7.3.0",
-    "react": "^18.3.1"
+    "pdf-parse": "^1.1.1",
+    "react": "^18.3.1",
+    "ws": "^8.19.0"
   },
   "optionalDependencies": {
     "@vscode/ripgrep": "^1.15.9"
@@ -32,6 +33,7 @@
   "devDependencies": {
     "@types/node": "^20.10.0",
     "@types/react": "^18.3.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.7.0",
     "typescript": "^5.3.0"
   },

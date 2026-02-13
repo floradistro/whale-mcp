@@ -399,6 +399,16 @@ async function callAPI(
           model: modelId,
           max_tokens: MAX_OUTPUT_TOKENS,
           stream: true, // Streaming keeps UI responsive
+          betas: ["context-management-2025-06-27"],
+          context_management: {
+            edits: [
+              {
+                type: "clear_tool_uses_20250919",
+                trigger: { type: "input_tokens", value: 80_000 },
+                keep: { type: "tool_uses", value: 3 },
+              },
+            ],
+          },
         }),
       });
 
