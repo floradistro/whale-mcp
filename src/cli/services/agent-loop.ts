@@ -37,17 +37,9 @@ import {
   createTurnContext,
   logSpan,
   generateSpanId,
-  getTurnNumber,
 } from "./telemetry.js";
-import {
-  runPreToolHooks,
-  runPostToolHooks,
-  runPromptSubmitHooks,
-} from "./hooks.js";
-import {
-  handleSlashCommand,
-  generateHelpText,
-} from "./slash-commands.js";
+// Re-exported at bottom; not used directly in this file
+// hooks.js and slash-commands.js are re-exported for ChatApp
 import {
   AgentEventEmitter,
   setGlobalEmitter,
@@ -70,6 +62,7 @@ export interface AgentLoopCallbacks {
 
 export interface AgentLoopOptions {
   message: string;
+  images?: { base64: string; mediaType: string }[]; // Image attachments (base64-encoded)
   conversationHistory: Anthropic.MessageParam[];
   callbacks: AgentLoopCallbacks;
   abortSignal?: AbortSignal;
@@ -645,72 +638,136 @@ export function isToolAllowedByPermission(toolName: string): boolean {
 // ============================================================================
 
 function buildSystemPrompt(hasServerTools: boolean, effort?: "low" | "medium" | "high"): string {
-  let prompt = `You are whale code, a CLI AI assistant.
+  const sections: string[] = [];
 
-## Working Directory
-${process.cwd()}`;
+  // ── Identity ──
+  sections.push(`You are whale code, an interactive CLI agent for software engineering and business operations.
+You help users with coding tasks, debugging, refactoring, and managing business data through tools.`);
 
-  // Git context
+  // ── Environment ──
+  const envLines = [
+    `Working directory: ${process.cwd()}`,
+    `Platform: ${process.platform}`,
+    `Date: ${new Date().toISOString().split("T")[0]}`,
+  ];
   const gitContext = gatherGitContext();
-  if (gitContext) {
-    prompt += `\n\n## Git\n${gitContext}`;
-  }
+  if (gitContext) envLines.push(`\n${gitContext}`);
+  sections.push(`# Environment\n${envLines.join("\n")}`);
 
-  prompt += `\n\n## Tool Use
-- Call multiple independent tools in ONE response (parallel execution)
-- Only chain across turns when a result is needed for the next call
-- If a tool fails 3 times, try a different approach
-- Use task with run_in_background:true for long tasks; check with task_output, stop with task_stop`;
+  // ── Doing tasks ──
+  sections.push(`# Doing tasks
+- The user will primarily request software engineering tasks: solving bugs, adding features, refactoring, explaining code, and more.
+- You are highly capable and can complete ambitious, multi-step tasks autonomously. Defer to user judgement about scope.
+- ALWAYS read relevant code before proposing changes. Do not modify files you haven't read. Understand existing patterns before editing.
+- Prefer editing existing files over creating new ones. Do not create files unless absolutely necessary.
+- Avoid over-engineering. Only make changes that are directly requested or clearly necessary. Keep solutions simple and focused.
+  - Don't add features, refactor code, or make "improvements" beyond what was asked.
+  - Don't add error handling or validation for scenarios that can't happen.
+  - Don't create abstractions for one-time operations.
+- Be careful not to introduce security vulnerabilities (command injection, XSS, SQL injection, etc.). If you notice insecure code you wrote, fix it immediately.
+- If your approach is blocked, do not brute force. Consider alternative approaches or ask the user.`);
+
+  // ── Coding workflow ──
+  sections.push(`# Mandatory coding workflow
+When making code changes, ALWAYS follow this sequence:
+
+1. **Read** — Read the files you intend to modify. Understand the existing code, imports, types, and patterns.
+2. **Plan** — For non-trivial changes, briefly state what you'll change and why BEFORE editing. For multi-file changes, list the files and the change for each.
+3. **Edit** — Make targeted, minimal changes. Keep edit batches small (5 or fewer edits before verifying).
+4. **Verify** — After each batch of edits, run the build or tests (e.g. \`npm run build\`, \`tsc --noEmit\`, \`pytest\`). Read the output. Fix errors before making more edits.
+5. **Report** — Summarize what you changed and the verification results.
+
+CRITICAL RULES:
+- NEVER skip step 1. Do not edit files you haven't read in this session.
+- NEVER make more than 5-8 edits without running a verification step.
+- If a build or test fails, read the error output carefully before attempting a fix. Do not guess.
+- If the same fix approach fails twice, STOP. Re-read the relevant code and try a fundamentally different approach.
+- If you are stuck after 3 failed attempts, explain what you've tried and ask the user for guidance.`);
+
+  // ── Actions with care ──
+  sections.push(`# Executing actions with care
+Consider the reversibility and blast radius of your actions:
+- Freely take local, reversible actions like editing files or running tests.
+- For hard-to-reverse or shared-state actions (deleting files, force-pushing, modifying CI, sending messages), check with the user first.
+- Do not use destructive actions as shortcuts. Identify root causes rather than bypassing safety checks.
+- If you encounter unexpected state (unfamiliar files, branches, config), investigate before overwriting — it may be the user's in-progress work.`);
+
+  // ── Tool use ──
+  let toolSection = `# Using tools
+- Use the RIGHT tool for the job. Do NOT use run_command when a dedicated tool exists:
+  - read_file to read files (not \`cat\` or \`head\`)
+  - edit_file or multi_edit to edit files (not \`sed\` or \`awk\`)
+  - write_file to create files (not \`echo >\` or heredocs)
+  - glob to find files by pattern (not \`find\` or \`ls\`)
+  - grep to search content (not \`grep\` or \`rg\` via run_command)
+  - run_command ONLY for shell operations: build, test, git, install, etc.
+- Call multiple INDEPENDENT tools in a single response for parallel execution. Do not chain when results are independent.
+- Only chain across turns when a result is needed for the next call.
+- If a tool fails, read the error. If it fails 3 times, try a different tool or approach entirely.
+
+## Subagents (task tool)
+- Use subagents for PARALLEL, INDEPENDENT research (e.g., searching different parts of the codebase simultaneously).
+- Use task with run_in_background:true for long-running tasks; check with task_output, stop with task_stop.
+- Do NOT spawn subagents for tasks you can do with a single glob or read_file.
+- Do NOT use team_create for bug fixes or single-file changes — work directly. Teams are for large features with 3+ independent workstreams.
+- Prefer "explore" type for quick codebase searches (2-4 turns). Prefer "general-purpose" for autonomous multi-step tasks.`;
 
   if (hasServerTools) {
-    prompt += `\n- Use audit_trail for store activity, telemetry for AI system metrics`;
-  }
+    toolSection += `
 
-  // Permission mode hint
+## Server tools (business operations)
+- Server tools (analytics, products, inventory, email, etc.) require UUIDs for mutations.
+- ALWAYS look up IDs first: use find/list actions to resolve names to UUIDs before calling create/update/delete.
+- Use audit_trail for store activity history (inventory changes, orders, transfers).
+- Use telemetry for AI system metrics (conversations, tool performance, errors).`;
+  }
+  sections.push(toolSection);
+
+  // ── Permission mode ──
   if (activePermissionMode === "plan") {
-    prompt += `\n\n## Mode: Plan (read-only)\nYou are in plan mode. Only read/search tools are available. No file writes or commands.`;
+    sections.push(`# Mode: Plan (read-only)
+You are in plan mode. Only read and search tools are available. No file writes or commands.`);
   } else if (activePermissionMode === "yolo") {
-    prompt += `\n\n## Mode: Yolo (full access)\nAll tools available without confirmation.`;
+    sections.push(`# Mode: Yolo
+All tools available without confirmation prompts.`);
   }
 
-  // Effort level
+  // ── Effort ──
   if (effort === "low") {
-    prompt += `\n\n## Effort: Low\nBe concise and direct. Minimize exploration. Give brief answers.`;
+    sections.push(`# Effort: Low
+Be concise and direct. Minimize exploration. Give brief answers. Skip verification for trivial changes.`);
   } else if (effort === "high") {
-    prompt += `\n\n## Effort: High\nBe thorough and exhaustive. Explore deeply. Verify your work.`;
+    sections.push(`# Effort: High
+Be thorough and exhaustive. Explore deeply. Verify all changes. Consider edge cases.`);
   }
 
-  // Persistent memory
-  const memory = loadMemory();
-  if (memory) {
-    prompt += `\n\n## Memory (persistent across sessions)\n${memory}`;
-  }
-
-  const claudeMd = loadClaudeMd();
-  if (claudeMd) {
-    prompt += `\n\n## Project Instructions (from ${claudeMd.path})\n\n${claudeMd.content}`;
-  }
-
-  prompt += `\n\n## Formatting Rules
-
-### Bar Charts
-Use \`\`\`chart code blocks for comparative data:
+  // ── Tone and style ──
+  sections.push(`# Tone and style
+- Be concise. Use tools to do work — don't just explain what you would do.
+- NEVER use emojis — terminal renders them as broken glyphs.
+- Include $ on monetary values, % on percentages.
+- When referencing code, include file_path:line_number for easy navigation.
+- Keep output clean and monospace-aligned.
+- Use markdown tables for multi-column data.
+- Use \`\`\`chart code blocks for bar charts:
 \`\`\`chart
 Title
 Label: $value
-\`\`\`
+\`\`\``);
 
-### Tables
-Use markdown tables for multi-column data.
+  // ── Persistent memory ──
+  const memory = loadMemory();
+  if (memory) {
+    sections.push(`# Memory (persistent across sessions)\n${memory}`);
+  }
 
-### Style
-- NEVER use emojis — terminal renders them as broken glyphs
-- Include $ on monetary values, % on percentages
-- Keep output clean and monospace-aligned
+  // ── Project instructions ──
+  const claudeMd = loadClaudeMd();
+  if (claudeMd) {
+    sections.push(`# Project Instructions (${claudeMd.path})\n${claudeMd.content}`);
+  }
 
-Be concise. Use tools to do work — don't just explain.`;
-
-  return prompt;
+  return sections.join("\n\n");
 }
 
 // ============================================================================
@@ -780,6 +837,9 @@ export { getServerStatus, type ServerStatus };
 
 const PROXY_URL = `${SUPABASE_URL}/functions/v1/agent-proxy`;
 const MAX_TURNS = 200; // Match Claude Code — effectively unlimited within a session
+
+// Module-level loop detector — persists session error state across turns
+let sessionLoopDetector: LoopDetector | null = null;
 
 /** Model-aware max output tokens */
 function getMaxOutputTokens(): number {
@@ -1101,12 +1161,38 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   const systemPrompt = buildSystemPrompt(serverToolCount > 0, opts.effort);
 
   // Context management is now server-side (Anthropic beta API handles compaction + tool clearing)
+  // Build user content — text-only string or content blocks array with images
+  let userContent: string | Anthropic.ContentBlockParam[];
+  if (opts.images && opts.images.length > 0) {
+    const blocks: Anthropic.ContentBlockParam[] = [];
+    for (const img of opts.images) {
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: img.mediaType as "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+          data: img.base64,
+        },
+      } as any);
+    }
+    blocks.push({ type: "text", text: message || "(see attached images)" });
+    userContent = blocks;
+  } else {
+    userContent = message;
+  }
+
   const messages: Anthropic.MessageParam[] = [
     ...conversationHistory,
-    { role: "user", content: message },
+    { role: "user", content: userContent },
   ];
 
-  const loopDetector = new LoopDetector();
+  // Session-level loop detector: persists failed strategies across turns.
+  // Created once per conversation, reset only when user starts a new conversation.
+  if (!sessionLoopDetector || conversationHistory.length === 0) {
+    sessionLoopDetector = new LoopDetector();
+  }
+  const loopDetector = sessionLoopDetector;
+  loopDetector.resetTurn();
 
   let totalIn = 0;
   let totalOut = 0;
@@ -1413,7 +1499,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         }
 
         const toolDurationMs = Date.now() - toolStart;
-        loopDetector.recordResult(tu.name, toolResult.success);
+        loopDetector.recordResult(tu.name, toolResult.success, tu.input);
         callbacks.onToolResult(tu.name, toolResult.success, toolResult.output, tu.input, toolDurationMs);
         emitter?.emitToolEnd(tu.id, tu.name, toolResult.success, toolResult.output, tu.input, toolDurationMs);
 
@@ -1470,6 +1556,28 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
       for (const tu of result.toolUseBlocks) {
         const r = toolResultMap.get(tu.id);
         if (r) toolResults.push(r);
+      }
+
+      // Bail-out detection: check if the agent is stuck in a failure loop
+      const bailCheck = loopDetector.endTurn();
+      if (bailCheck.shouldBail && toolResults.length > 0) {
+        logSpan({
+          action: "chat.bail_out",
+          durationMs: Date.now() - sessionStart,
+          context: turnCtx,
+          storeId: storeId || undefined,
+          severity: "warn",
+          details: {
+            ...loopDetector.getSessionStats(),
+            message: bailCheck.message,
+            iteration,
+          },
+        });
+        // Prepend bail-out guidance to the last tool result so the model sees it
+        const lastResult = toolResults[toolResults.length - 1];
+        if (typeof lastResult.content === "string") {
+          lastResult.content = `[SYSTEM WARNING] ${bailCheck.message}\n\n${lastResult.content}`;
+        }
       }
 
       // Append assistant response + tool results for next turn
